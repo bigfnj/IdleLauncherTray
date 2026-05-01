@@ -13,6 +13,10 @@
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
 
+    <!-- SmartScreen hardening flags -->
+    <EnableComInterop>false</EnableComInterop>
+    <DebugType>embedded</DebugType>
+
     <!-- Uses matrix.ico as the EXE icon (and our default tray icon via ExtractAssociatedIcon). -->
     <ApplicationIcon>matrix.ico</ApplicationIcon>
   </PropertyGroup>
