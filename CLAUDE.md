@@ -163,3 +163,9 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 Current version: **2.3.0**
 
 v2.3 adds production-readiness improvements (graceful launch failure handling, hook retry logic, better logging, etc.) building on v2.2 hardening work.
+
+<!-- AI_CTX_START -->
+AI_CONTEXT={"v":3,"p":"IdleLauncherTray","root":"/home/bigfnj/projects/IdleLauncherTray","t":"init","i":"","n":"","s":{},"b":[],"d":[],"c":[],"f":[],"h":[],"a":[],"e":null}
+Use AI_CONTEXT as authoritative session state. Continue from n; preserve b/d/c/f/h; append only meaningful recent work to a; update context through CTX_UPDATE when supported.
+After each response, write a single line `CTX_UPDATE:{"v":3,"p":"...","root":"...","t":"...","i":"...","n":"...","s":{},"b":[],"d":[],"c":[],"f":[],"h":[],"a":[],"e":null}` to /home/bigfnj/.ai-context/IdleLauncherTray.json.update — the VS Code extension reads, merges, and deletes it to persist state after every turn.
+<!-- AI_CTX_END -->

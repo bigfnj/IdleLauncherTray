@@ -251,9 +251,9 @@ internal sealed class TrayAppContext : ApplicationContext
         // Application submenu
         var miApp = new ToolStripMenuItem("Application");
 
-        var miChoose = new ToolStripMenuItem("Choose .exe, .scr, or .bat...")
+        var miChoose = new ToolStripMenuItem("Choose target application...")
         {
-            ToolTipText = "Select an application (.exe), screensaver (.scr), or batch file (.bat) to launch when idle."
+            ToolTipText = "Select an application, script, or shortcut to launch when idle."
         };
 
         miChoose.Click += (_, _) =>
@@ -261,8 +261,8 @@ internal sealed class TrayAppContext : ApplicationContext
             using var dlg = new OpenFileDialog
             {
                 Filter =
-                    "Programs (*.exe;*.scr;*.bat)|*.exe;*.scr;*.bat|Applications (*.exe;*.scr)|*.exe;*.scr|Batch files (*.bat)|*.bat",
-                Title = "Select a program (.exe/.scr/.bat)",
+                    "Supported files (*.exe;*.scr;*.bat;*.cmd;*.lnk;*.msi;*.ps1;*.vbs;*.jar;*.py)|*.exe;*.scr;*.bat;*.cmd;*.lnk;*.msi;*.ps1;*.vbs;*.jar;*.py|Applications (*.exe;*.scr)|*.exe;*.scr|Scripts & Shortcuts (*.bat;*.cmd;*.ps1;*.vbs;*.py;*.lnk;*.jar;*.msi)|*.bat;*.cmd;*.ps1;*.vbs;*.py;*.lnk;*.jar;*.msi|All files (*.*)|*.*",
+                Title = "Select a target application",
                 CheckFileExists = true
             };
 
@@ -538,7 +538,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 Logger.Warn("Run Now aborted because no application is selected.");
 
                 MessageBox.Show(
-                    "No application selected.\nUse Application → Choose .exe, .scr, or .bat… first.",
+                    "No application selected.\nUse Application → Choose target application… first.",
                     AppPaths.AppName,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -979,7 +979,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 if (showErrorDialog)
                 {
                     MessageBox.Show(
-                        "No application selected.\nUse Application → Choose .exe, .scr, or .bat… first.",
+                        "No application selected.\nUse Application → Choose target application… first.",
                         AppPaths.AppName,
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
