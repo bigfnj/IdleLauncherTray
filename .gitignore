@@ -1,0 +1,47 @@
+# Agent & AI Files
+.claude/
+.ai-context/
+.copilot-instructions
+CLAUDE.md
+AI_UNDERSTANDING.md
+ClientBriefing.md
+*.session.*
+.agent-cache/
+
+# Build Results
+bin/
+obj/
+Debug/
+Release/
+*.exe
+*.dll
+*.pdb
+*.dbmdl
+*.mdf
+*.ldf
+
+# Visual Studio
+.vs/
+.vscode/
+*.user
+*.userprefs
+*.sln.iml
+*.suo
+.DS_Store
+
+# NuGet
+packages/
+*.nupkg
+.nuget/
+
+# Build Artifacts
+publish/
+PublishProfiles/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
