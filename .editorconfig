@@ -1,0 +1,28 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+trim_trailing_whitespace = true
+
+[*.cs]
+indent_style = space
+indent_size = 4
+
+# Keep 'System' usings first.
+dotnet_sort_system_directives_first = true
+
+# Prefer braces for clarity/safety.
+csharp_prefer_braces = true:suggestion
+
+# New lines / braces (Allman-ish)
+csharp_new_line_before_open_brace = all
+
+# Prefer explicit accessibility modifiers (matches most .NET codebases)
+dotnet_style_require_accessibility_modifiers = always:suggestion
+
+# 'var' usage: keep it when it's obvious.
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_var_elsewhere = false:suggestion
+csharp_style_var_for_built_in_types = false:suggestion

@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Version>2.3.0</Version>
+    <AssemblyVersion>2.3.0.0</AssemblyVersion>
+    <FileVersion>2.3.0.0</FileVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- Uses matrix.ico as the EXE icon (and our default tray icon via ExtractAssociatedIcon). -->
+    <ApplicationIcon>matrix.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="matrix.ico" />
+  </ItemGroup>
+
+</Project>
