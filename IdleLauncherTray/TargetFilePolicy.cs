@@ -10,10 +10,17 @@ internal static class TargetFilePolicy
     {
         ".exe",
         ".scr",
-        ".bat"
+        ".bat",
+        ".cmd",
+        ".lnk",
+        ".msi",
+        ".ps1",
+        ".vbs",
+        ".jar",
+        ".py"
     };
 
-    public const string SupportedExtensionsDisplay = ".exe, .scr, or .bat";
+    public const string SupportedExtensionsDisplay = ".exe, .scr, .bat, .cmd, .lnk, .msi, .ps1, .vbs, .jar, or .py";
 
     private static string PrepareCandidatePath(string? path)
     {
