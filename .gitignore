@@ -2,7 +2,6 @@
 .claude/
 .ai-context/
 .copilot-instructions
-CLAUDE.md
 AI_UNDERSTANDING.md
 ClientBriefing.md
 *.session.*
@@ -45,3 +44,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+AGENTS.md
+.github/copilot-instructions.md
