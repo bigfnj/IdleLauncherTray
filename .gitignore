@@ -4,6 +4,7 @@
 .copilot-instructions
 AI_UNDERSTANDING.md
 ClientBriefing.md
+BACKLOG.md
 *.session.*
 .agent-cache/
 
