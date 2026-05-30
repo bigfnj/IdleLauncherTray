@@ -29,10 +29,11 @@ jobs:
       - name: Publish smoke test (single-file, framework-dependent)
         # Verifies the publish profile still produces a single EXE — catches
         # accidental profile breakage before it makes it into a tag.
+        # No --no-restore: the publish profile pins RuntimeIdentifier=win-x64
+        # which requires its own RID-specific restore separate from the solution restore.
         run: |
           dotnet publish IdleLauncherTray\IdleLauncherTray.csproj `
-            -p:PublishProfile=IdleLauncherTray_v2_3_FrameworkDependent_SingleExe `
-            --no-restore
+            -p:PublishProfile=IdleLauncherTray_v2_3_FrameworkDependent_SingleExe
 
       - name: Confirm single-file output
         shell: pwsh
