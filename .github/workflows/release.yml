@@ -34,18 +34,16 @@ jobs:
           "assembly=$asmVer"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Tag: $tag | Version: $ver | AssemblyVersion: $asmVer"
 
-      - name: Restore
-        run: dotnet restore IdleLauncherTray.sln
-
       - name: Publish single-file, framework-dependent
+        # No separate restore step + no --no-restore: dotnet publish does its own
+        # RID-specific restore for win-x64 as pinned by the publish profile.
         shell: pwsh
         run: |
           dotnet publish IdleLauncherTray\IdleLauncherTray.csproj `
             -p:PublishProfile=IdleLauncherTray_v2_3_FrameworkDependent_SingleExe `
             -p:Version=${{ steps.version.outputs.version }} `
             -p:AssemblyVersion=${{ steps.version.outputs.assembly }} `
-            -p:FileVersion=${{ steps.version.outputs.assembly }} `
-            --no-restore
+            -p:FileVersion=${{ steps.version.outputs.assembly }}
 
       - name: Package release zip
         id: package
