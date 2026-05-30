@@ -46,6 +46,21 @@ internal sealed class CpuUsageMonitor
             return false;
         }
 
+        // GetSystemTimes returns FILETIME values (100ns ticks since 1601). They
+        // monotonically increase, but a counter wrap, system clock change, or a
+        // driver that reports a non-monotonic value could leave one of the new
+        // samples smaller than the previous one. With unsigned arithmetic that
+        // would silently underflow and produce a wildly inflated delta. Detect
+        // the regression, re-baseline, and skip this sample so the caller
+        // doesn't see a garbage CPU reading.
+        if (idle < _prevIdle || kernel < _prevKernel || user < _prevUser)
+        {
+            _prevIdle = idle;
+            _prevKernel = kernel;
+            _prevUser = user;
+            return false;
+        }
+
         var idleDelta = idle - _prevIdle;
         var kernelDelta = kernel - _prevKernel;
         var userDelta = user - _prevUser;

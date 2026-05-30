@@ -49,6 +49,19 @@ internal static class DeletionHelper
         try
         {
             using var child = Process.Start(psi);
+            if (child != null)
+            {
+                // Note: this runs in the *outgoing* tray process. We do NOT block on
+                // WaitForExit() here because the parent is about to ExitThread —
+                // doing so would deadlock. Instead the cleanup child waits for our
+                // PID to exit (see RunCleanupWorker) before doing the actual delete.
+                Logger.Info($"Spawned deferred cleanup helper for '{normalizedFolder}'. ChildPid={child.Id}.");
+            }
+            else
+            {
+                Logger.Warn($"Process.Start returned null when spawning cleanup helper for '{normalizedFolder}'. Falling back to in-process deletion.");
+                TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: DefaultInitialWaitMs);
+            }
         }
         catch (Exception ex)
         {
@@ -73,11 +86,33 @@ internal static class DeletionHelper
         var normalizedFolder = NormalizeFolderPath(folderToDelete);
         if (!IsSafeDeleteTarget(normalizedFolder))
         {
+            // IsSafeDeleteTarget already logs the rejection reason.
             return;
         }
 
         WaitForParentExit(parentPid, initialWaitMs);
-        TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: 0);
+
+        // Log the outcome so a silent failure (locked file, permission denied)
+        // shows up in the log instead of vanishing — note that this log entry
+        // is written *after* the parent has exited, so it lands in the same
+        // log file the user will inspect post-uninstall.
+        var deleted = TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: 0);
+        try
+        {
+            if (deleted)
+            {
+                Logger.Info($"Deferred cleanup completed. Folder='{normalizedFolder}'.");
+            }
+            else
+            {
+                Logger.Warn($"Deferred cleanup did not fully delete the folder after {MaxDeleteAttempts} attempts. Folder='{normalizedFolder}'.");
+            }
+        }
+        catch
+        {
+            // Logging during cleanup is best-effort; the folder itself may be
+            // the log directory.
+        }
     }
 
     private static void WaitForParentExit(int parentPid, int fallbackWaitMs)
@@ -178,6 +213,12 @@ internal static class DeletionHelper
         }
     }
 
+    // Defence-in-depth: the only legitimate use of this helper is to delete the
+    // app's own %APPDATA%\IdleLauncherTray folder during portable uninstall.
+    // Restricting to that exact path means that even if an attacker is able to
+    // launch IdleLauncherTray.exe with --cleanup-folder pointing somewhere else,
+    // we refuse to operate on arbitrary directories. The filesystem-root check
+    // is kept as a redundant safety net.
     private static bool IsSafeDeleteTarget(string? folderPath)
     {
         if (string.IsNullOrWhiteSpace(folderPath))
@@ -194,7 +235,32 @@ internal static class DeletionHelper
         var normalizedPath = folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
-        return !string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase);
+        if (string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Only allow deletion of the app's own base directory — no other paths.
+        var expectedBaseDir = NormalizeFolderPath(AppPaths.BaseDir);
+        if (string.IsNullOrWhiteSpace(expectedBaseDir))
+        {
+            return false;
+        }
+
+        if (!string.Equals(normalizedPath, expectedBaseDir, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                Logger.Warn($"DeletionHelper refused to operate on a path outside AppPaths.BaseDir. Requested='{normalizedPath}' Expected='{expectedBaseDir}'.");
+            }
+            catch
+            {
+                // Best effort.
+            }
+            return false;
+        }
+
+        return true;
     }
 
     private static bool TryDeleteFolderWithRetries(string folderPath, int initialWaitMs)

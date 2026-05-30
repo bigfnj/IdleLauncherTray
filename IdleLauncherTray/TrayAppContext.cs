@@ -22,6 +22,13 @@ internal sealed class TrayAppContext : ApplicationContext
     private const int CheckIntervalSeconds = 5;
     private const int MinLaunchCooldownSeconds = 10;
     private const int AutomaticLaunchFailureBalloonTimeoutMs = 10000;
+    private const int BalloonTipTitleMaxLength = 63;
+    private const int BalloonTipTextMaxLength = 255;
+    private const int TransientLaunchRetryCount = 1;
+    private const int TransientLaunchRetryDelayMs = 250;
+
+    private static readonly int[] IdleTimerOptionMinutes = { 1, 3, 5, 10, 15, 20, 30 };
+    private static readonly int[] CpuThresholdOptionPercents = { 10, 20, 30, 40, 50 };
 
     private readonly NotifyIcon _notify;
     private readonly ContextMenuStrip _menu;
@@ -59,7 +66,10 @@ internal sealed class TrayAppContext : ApplicationContext
     private bool? _lastSuppressionState;
     private bool _trackedProcessWasIdleLaunch;
 
-    private sealed class LaunchEvaluation
+    // Mutable record (init-style construction via object initializer, then field
+    // updates as the evaluation progresses). Record gives us auto-equality and
+    // ToString() for free; we keep the explicit Describe() for human-readable logs.
+    private sealed record LaunchEvaluation
     {
         public string TargetPath { get; set; } = string.Empty;
         public bool HasTarget { get; set; }
@@ -110,8 +120,16 @@ internal sealed class TrayAppContext : ApplicationContext
 
     public TrayAppContext()
     {
-        _cfg = ConfigManager.Load();
-        LogConfigurationSummary();
+        // Wrap the entire initialisation in try/catch so that, if any step throws
+        // (corrupt config, hooks rejected, NotifyIcon creation fails, etc.), we
+        // tear down anything that's already been allocated instead of leaving
+        // tray icons / menus / hooks / processes dangling. ShutdownForExit is
+        // idempotent and null-safe via its per-step try/catch blocks, so it's
+        // safe to call here regardless of how far construction progressed.
+        try
+        {
+            _cfg = ConfigManager.Load();
+            LogConfigurationSummary();
 
         // Configure/Start physical-idle tracking hooks
         PhysicalIdle.GamepadEnabled = _cfg.GamepadCountsAsActivity;
@@ -182,9 +200,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
         // Idle timer submenu
         var miIdle = new ToolStripMenuItem("Idle timer");
-        int[] idleOptions = { 1, 3, 5, 10, 15, 20, 30 };
 
-        foreach (var minutes in idleOptions)
+        foreach (var minutes in IdleTimerOptionMinutes)
         {
             var item = new ToolStripMenuItem($"{minutes} minute{(minutes == 1 ? string.Empty : "s")}")
             {
@@ -192,7 +209,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 Checked = _cfg.IdleMinutes == minutes
             };
 
-            item.Click += (_, _) =>
+            item.Click += (_, _) => RunMenuAction("Set idle timer", () =>
             {
                 var chosen = (int)item.Tag!;
                 _cfg.IdleMinutes = chosen;
@@ -205,7 +222,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 ConfigManager.Save(_cfg);
                 InvalidateReadinessSnapshot();
                 Logger.Info($"Idle timer set to {chosen} minute(s).");
-            };
+            });
 
             _idleTimerItems.Add(item);
             miIdle.DropDownItems.Add(item);
@@ -215,9 +232,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
         // CPU Threshold submenu
         var miCpu = new ToolStripMenuItem("CPU Threshold");
-        int[] cpuOptions = { 10, 20, 30, 40, 50 };
 
-        foreach (var pct in cpuOptions)
+        foreach (var pct in CpuThresholdOptionPercents)
         {
             var item = new ToolStripMenuItem($"{pct}%")
             {
@@ -226,7 +242,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 ToolTipText = "Only launch when total CPU usage is at or below this threshold."
             };
 
-            item.Click += (_, _) =>
+            item.Click += (_, _) => RunMenuAction("Set CPU threshold", () =>
             {
                 var chosen = (int)item.Tag!;
                 chosen = AppConfig.NormalizeCpuThresholdPercent(chosen);
@@ -240,7 +256,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 ConfigManager.Save(_cfg);
                 InvalidateReadinessSnapshot();
                 Logger.Info($"CPU threshold set to {chosen}%.");
-            };
+            });
 
             _cpuThresholdItems.Add(item);
             miCpu.DropDownItems.Add(item);
@@ -256,7 +272,7 @@ internal sealed class TrayAppContext : ApplicationContext
             ToolTipText = "Select an application, script, or shortcut to launch when idle."
         };
 
-        miChoose.Click += (_, _) =>
+        miChoose.Click += (_, _) => RunMenuAction("Choose target application", () =>
         {
             using var dlg = new OpenFileDialog
             {
@@ -287,7 +303,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 InvalidateReadinessSnapshot();
                 Logger.Info($"Selected application changed to '{_cfg.AppPath}'.");
             }
-        };
+        });
 
         var miSetArgs = new ToolStripMenuItem("Set arguments...")
         {
@@ -356,7 +372,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 "When enabled, injected/virtual input (e.g., SendKeys) is blocked while the launched app/screensaver is running."
         };
 
-        _miBlockInjected.Click += (_, _) =>
+        _miBlockInjected.Click += (_, _) => RunMenuAction("Toggle 'Block injected input'", () =>
         {
             _cfg.BlockInjectedWhileRunning = _miBlockInjected.Checked;
             ConfigManager.Save(_cfg);
@@ -366,7 +382,7 @@ internal sealed class TrayAppContext : ApplicationContext
                     ? "blocking while running was enabled"
                     : "blocking while running was disabled");
             Logger.Info($"Block injected input while running set to {_cfg.BlockInjectedWhileRunning}.");
-        };
+        });
 
         miOptions.DropDownItems.Add(_miBlockInjected);
 
@@ -378,7 +394,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 "When enabled, Windows will lock after an application or screensaver that was launched automatically by idle detection closes. Manual Run Now launches do not trigger this."
         };
 
-        _miLockPcOnAppClose.Click += (_, _) =>
+        _miLockPcOnAppClose.Click += (_, _) => RunMenuAction("Toggle 'Lock PC on App Close'", () =>
         {
             _cfg.LockPcOnAppClose = _miLockPcOnAppClose.Checked;
             ConfigManager.Save(_cfg);
@@ -393,7 +409,7 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 Logger.Info($"Lock PC on App Close set to {_cfg.LockPcOnAppClose}.");
             }
-        };
+        });
 
         miOptions.DropDownItems.Add(_miLockPcOnAppClose);
 
@@ -430,13 +446,13 @@ internal sealed class TrayAppContext : ApplicationContext
             Checked = _cfg.TrayIconEnabled
         };
 
-        _miTrayIconEnabled.Click += (_, _) =>
+        _miTrayIconEnabled.Click += (_, _) => RunMenuAction("Toggle 'Use custom tray icon'", () =>
         {
             _cfg.TrayIconEnabled = _miTrayIconEnabled.Checked;
             ConfigManager.Save(_cfg);
             Logger.Info($"Use custom tray icon set to {_cfg.TrayIconEnabled}.");
             ApplyTrayIcon();
-        };
+        });
 
         // Choose tray icon
         var miChooseIcon = new ToolStripMenuItem("Choose tray icon (.ico)...")
@@ -529,7 +545,7 @@ internal sealed class TrayAppContext : ApplicationContext
             ToolTipText = "Launch the selected application immediately (bypasses idle timer and CPU check)."
         };
 
-        miRunNow.Click += (_, _) =>
+        miRunNow.Click += (_, _) => RunMenuAction("Run Now", () =>
         {
             Logger.Info("Run Now requested from tray menu.");
 
@@ -573,7 +589,7 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 DisarmAfterLaunch("manual Run Now");
             }
-        };
+        });
 
         _menu.Items.Add(miRunNow);
         _menu.Items.Add(new ToolStripSeparator());
@@ -657,8 +673,17 @@ internal sealed class TrayAppContext : ApplicationContext
         _timer.Tick += (_, _) => OnTick();
         _timer.Start();
 
-        Logger.Info(
-            $"Monitoring started. CheckIntervalSeconds={CheckIntervalSeconds}; MinLaunchCooldownSeconds={MinLaunchCooldownSeconds}; PortableExecutable='{AppPaths.CurrentExePath}'.");
+            Logger.Info(
+                $"Monitoring started. CheckIntervalSeconds={CheckIntervalSeconds}; MinLaunchCooldownSeconds={MinLaunchCooldownSeconds}; PortableExecutable='{AppPaths.CurrentExePath}'.");
+        }
+        catch (Exception ex)
+        {
+            try { Logger.Error("TrayAppContext construction failed; cleaning up partial state.", ex); }
+            catch { /* logger may itself be impaired */ }
+
+            ShutdownForExit();
+            throw;
+        }
     }
 
     private void UpdateSelectedAppMenuText()
@@ -699,18 +724,35 @@ internal sealed class TrayAppContext : ApplicationContext
         _miArguments.ToolTipText = args;
     }
 
-    private void ApplyTrayIcon()
+    // Always clear NotifyIcon.Icon first so the tray never holds a reference to a
+    // disposed Icon object — otherwise a tray repaint between Dispose() and the new
+    // assignment can hit ObjectDisposedException.
+    private void DetachAndDisposeCurrentTrayIcon()
     {
+        try
+        {
+            if (_notify != null) _notify.Icon = null;
+        }
+        catch
+        {
+            // Ignore — best effort.
+        }
+
         try
         {
             _trayIconObj?.Dispose();
         }
         catch
         {
-            // Ignore.
+            // Ignore disposal failures.
         }
 
         _trayIconObj = null;
+    }
+
+    private void ApplyTrayIcon()
+    {
+        DetachAndDisposeCurrentTrayIcon();
 
         // 1) Custom icon (if enabled)
         try
@@ -741,15 +783,6 @@ internal sealed class TrayAppContext : ApplicationContext
 
                     if (loaded != null)
                     {
-                        try
-                        {
-                            _trayIconObj?.Dispose();
-                        }
-                        catch
-                        {
-                            // Ignore disposal failure of the previous icon.
-                        }
-
                         _trayIconObj = loaded;
                         _notify.Icon = _trayIconObj;
                         Logger.Info($"Applied custom tray icon from '{path}'.");
@@ -780,16 +813,6 @@ internal sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            // Dispose any previously-held custom icon before replacing it.
-            try
-            {
-                _trayIconObj?.Dispose();
-            }
-            catch
-            {
-                // Ignore disposal failures.
-            }
-
             _trayIconObj = (Icon)(extractedExeIcon?.Clone() ?? SystemIcons.Application.Clone());
             _notify.Icon = _trayIconObj;
             Logger.Info("Applied default tray icon.");
@@ -815,6 +838,35 @@ internal sealed class TrayAppContext : ApplicationContext
     private static int GetIdleSeconds()
     {
         return (int)Math.Floor(PhysicalIdle.GetIdleMilliseconds() / 1000.0);
+    }
+
+    // Centralised exception handling for tray menu Click handlers. Any handler that
+    // mutates settings / writes config / touches the registry / spawns a process
+    // should run through this so an unexpected exception logs cleanly and surfaces
+    // a single MessageBox instead of escaping to the WinForms message pump.
+    private static void RunMenuAction(string actionDescription, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"Menu action failed: {actionDescription}.", ex);
+            try
+            {
+                MessageBox.Show(
+                    $"{actionDescription} failed:\n{ex.Message}",
+                    AppPaths.AppName,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            catch
+            {
+                // If even the MessageBox blows up, we've at least logged the
+                // original exception — don't let the dialog failure mask it.
+            }
+        }
     }
 
     private void OnTick()
@@ -843,7 +895,7 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 if (_armed)
                 {
-                    if (TryLaunchSelectedApp("automatic idle trigger", launchedFromIdle: true, showErrorDialog: false, out var failureMessage))
+                    if (TryLaunchWithTransientRetry("automatic idle trigger", out var failureMessage))
                     {
                         DisarmAfterLaunch("automatic idle trigger");
                     }
@@ -954,6 +1006,31 @@ internal sealed class TrayAppContext : ApplicationContext
         }
 
         return evaluation;
+    }
+
+    // Retry wrapper for automatic idle-triggered launches. Transient failures like an
+    // antivirus scan briefly holding the target executable's file handle should not
+    // disarm the launcher and force the user to wiggle the mouse. We only retry on
+    // genuinely transient errors (IO / unauthorized access) detected by the inner
+    // launch path returning failure. The retry budget is intentionally small to keep
+    // total tick latency bounded.
+    private bool TryLaunchWithTransientRetry(string trigger, out string failureMessage)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            if (TryLaunchSelectedApp(trigger, launchedFromIdle: true, showErrorDialog: false, out failureMessage))
+            {
+                return true;
+            }
+
+            if (attempt >= TransientLaunchRetryCount)
+            {
+                return false;
+            }
+
+            Logger.Warn($"Transient launch failure on attempt {attempt + 1}. Retrying after {TransientLaunchRetryDelayMs}ms. Trigger='{trigger}' Failure='{failureMessage}'.");
+            try { Thread.Sleep(TransientLaunchRetryDelayMs); } catch { /* ignore */ }
+        }
     }
 
     private bool TryLaunchSelectedApp(string trigger, bool launchedFromIdle, bool showErrorDialog, out string failureMessage)
@@ -1168,8 +1245,8 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         try
         {
-            var safeTitle = TruncateForBalloonTip(title, 63);
-            var safeText = TruncateForBalloonTip(text, 255);
+            var safeTitle = TruncateForBalloonTip(title, BalloonTipTitleMaxLength);
+            var safeText = TruncateForBalloonTip(text, BalloonTipTextMaxLength);
             _notify.ShowBalloonTip(AutomaticLaunchFailureBalloonTimeoutMs, safeTitle, safeText, icon);
         }
         catch (Exception ex)
