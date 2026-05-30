@@ -5,6 +5,13 @@ using System.Text;
 
 namespace IdleLauncherTray;
 
+// Logger uses a single global lock + synchronous File.AppendAllText. For the volume
+// this app produces (a few lines per minute, AppData being a local SSD path on every
+// supported platform) this is fine and keeps crash diagnostics complete — every log
+// line is durably on disk by the time the call returns. A background-queue writer
+// would be more scalable but introduces a window where in-flight log lines vanish if
+// the process aborts before the queue drains. Keep the simple synchronous design
+// unless logging volume becomes a real bottleneck.
 internal static class Logger
 {
     private static readonly object _gate = new();
@@ -17,7 +24,10 @@ internal static class Logger
     private static int _writeCount;
     private const int RotationCheckInterval = 10;
 
-    public static string LogPath => Path.Combine(AppPaths.BaseDir, $"{AppPaths.AppName}.log");
+    // Cache the resolved log path. AppPaths.BaseDir is computed once at type init, so
+    // there's no point re-running Path.Combine on every Write() call.
+    private static readonly string _logPath = Path.Combine(AppPaths.BaseDir, $"{AppPaths.AppName}.log");
+    public static string LogPath => _logPath;
 
     public static void Info(string message)
     {
@@ -68,7 +78,7 @@ internal static class Logger
                     RotateIfNeeded();
                 }
 
-                File.AppendAllText(LogPath, sb.ToString());
+                File.AppendAllText(_logPath, sb.ToString());
             }
         }
         catch
@@ -109,12 +119,12 @@ internal static class Logger
     {
         try
         {
-            if (!File.Exists(LogPath))
+            if (!File.Exists(_logPath))
             {
                 return;
             }
 
-            var fi = new FileInfo(LogPath);
+            var fi = new FileInfo(_logPath);
 
             const long maxBytes = 2_000_000; // ~2MB
             if (fi.Length <= maxBytes)
@@ -122,8 +132,8 @@ internal static class Logger
                 return;
             }
 
-            var oldPath = LogPath + ".old";
-            File.Move(LogPath, oldPath, overwrite: true);
+            var oldPath = _logPath + ".old";
+            File.Move(_logPath, oldPath, overwrite: true);
         }
         catch
         {

@@ -87,15 +87,19 @@ internal static class ConfigManager
 
     public static void Save(AppConfig cfg)
     {
+        var tmpPath = AppPaths.ConfigPath + ".tmp";
+
         try
         {
             NormalizeInPlace(cfg);
             Directory.CreateDirectory(AppPaths.BaseDir);
 
             // Write atomically to reduce the chance of a partially-written config file
-            // (e.g. power loss / crash mid-write).
+            // (e.g. power loss / crash mid-write). On failure we still need to remove
+            // the stale .tmp file in the finally below — otherwise a successful
+            // WriteAllText followed by a failed Move would leave orphaned junk in
+            // %APPDATA% that survives across runs.
             var json = JsonSerializer.Serialize(cfg, Options);
-            var tmpPath = AppPaths.ConfigPath + ".tmp";
 
             File.WriteAllText(tmpPath, json);
             File.Move(tmpPath, AppPaths.ConfigPath, overwrite: true);
@@ -110,6 +114,23 @@ internal static class ConfigManager
             catch
             {
                 // Ignore.
+            }
+        }
+        finally
+        {
+            // Clean up the staging file if anything went wrong between WriteAllText
+            // and Move. The Move succeeds by renaming so the .tmp normally vanishes,
+            // but if Move threw we still need to remove the orphaned .tmp.
+            try
+            {
+                if (File.Exists(tmpPath))
+                {
+                    File.Delete(tmpPath);
+                }
+            }
+            catch
+            {
+                // Best effort; we already logged the original failure above.
             }
         }
     }
