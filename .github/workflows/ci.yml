@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Publish Smoke Test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore IdleLauncherTray.sln
+
+      - name: Build (Release)
+        run: dotnet build IdleLauncherTray.sln --configuration Release --no-restore
+
+      - name: Publish smoke test (single-file, framework-dependent)
+        # Verifies the publish profile still produces a single EXE — catches
+        # accidental profile breakage before it makes it into a tag.
+        run: |
+          dotnet publish IdleLauncherTray\IdleLauncherTray.csproj `
+            -p:PublishProfile=IdleLauncherTray_v2_3_FrameworkDependent_SingleExe `
+            --no-restore
+
+      - name: Confirm single-file output
+        shell: pwsh
+        run: |
+          $outDir = "IdleLauncherTray\bin\Publish\win-x64-framework-dependent-singlefile"
+          $files = Get-ChildItem $outDir -File
+          Write-Host "Publish output ($($files.Count) file(s)):"
+          $files | ForEach-Object { Write-Host "  $($_.Name) — $('{0:N0}' -f $_.Length) bytes" }
+          $exe = $files | Where-Object { $_.Name -eq 'IdleLauncherTray.exe' }
+          if (-not $exe) { throw "IdleLauncherTray.exe not produced!" }
+          # A framework-dependent single-file publish should emit only the EXE
+          # (debug symbols are embedded per the profile's <DebugType>embedded</DebugType>).
+          if ($files.Count -ne 1) {
+            throw "Expected exactly one published file but got $($files.Count). Single-file profile may be broken."
+          }

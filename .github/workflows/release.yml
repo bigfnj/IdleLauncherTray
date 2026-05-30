@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+jobs:
+  release:
+    name: Build, Publish, and Release
+    runs-on: windows-latest
+    permissions:
+      contents: write   # required to create GitHub Releases on a public repo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Derive version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"          # e.g. v2.3.0
+          $ver = $tag.TrimStart('v')               # e.g. 2.3.0
+          # AssemblyVersion requires the 4-part Major.Minor.Build.Revision form;
+          # FileVersion + Version accept Major.Minor.Patch fine.
+          $asmVer = "$ver.0"
+          "version=$ver"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "assembly=$asmVer"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Tag: $tag | Version: $ver | AssemblyVersion: $asmVer"
+
+      - name: Restore
+        run: dotnet restore IdleLauncherTray.sln
+
+      - name: Publish single-file, framework-dependent
+        shell: pwsh
+        run: |
+          dotnet publish IdleLauncherTray\IdleLauncherTray.csproj `
+            -p:PublishProfile=IdleLauncherTray_v2_3_FrameworkDependent_SingleExe `
+            -p:Version=${{ steps.version.outputs.version }} `
+            -p:AssemblyVersion=${{ steps.version.outputs.assembly }} `
+            -p:FileVersion=${{ steps.version.outputs.assembly }} `
+            --no-restore
+
+      - name: Package release zip
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag     = "${{ github.ref_name }}"
+          $pubDir  = "IdleLauncherTray\bin\Publish\win-x64-framework-dependent-singlefile"
+          $stage   = "stage\IdleLauncherTray-$tag-win-x64"
+          $zipName = "IdleLauncherTray-$tag-win-x64-framework-dependent-singlefile.zip"
+
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "$pubDir\IdleLauncherTray.exe" $stage
+          Copy-Item README.md  $stage
+          Copy-Item LICENSE    $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath $zipName
+
+          $zipFile = Get-Item $zipName
+          Write-Host "Created $($zipFile.Name) — $('{0:N0}' -f $zipFile.Length) bytes"
+
+          "zip=$zipName"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Compute SHA256
+        shell: pwsh
+        run: |
+          $zip = "${{ steps.package.outputs.zip }}"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: IdleLauncherTray ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
