@@ -6,6 +6,7 @@ AI_UNDERSTANDING.md
 ClientBriefing.md
 BACKLOG.md
 *.session.*
+SESSION_HANDOFF.md
 .agent-cache/
 
 # Build Results

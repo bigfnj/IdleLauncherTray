@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/PhysicalIdle.cs",
+  "sha1": "9827cf78fbb7d69a72810a88ae8102cbcc8740e3",
+  "purpose": "Tracks real physical user idle time by installing WH_KEYBOARD_LL and WH_MOUSE_LL hooks that ignore injected (automation) input; optionally counts XInput gamepad activity as user presence.",
+  "exports": ["PhysicalIdle.Start", "PhysicalIdle.Stop", "PhysicalIdle.GetIdleMilliseconds", "PhysicalIdle.TryRepairHooksIfNeeded", "PhysicalIdle.SetGamepadEnabled", "PhysicalIdle.SuppressInjected", "PhysicalIdle.UseSystemIdleFailSafe"],
+  "imports": ["System", "System.Runtime.InteropServices", "System.Threading"],
+  "called_by": ["TrayAppContext.cs"],
+  "calls_out_to": [
+    "user32!SetWindowsHookEx — installs low-level keyboard/mouse hooks",
+    "user32!UnhookWindowsHookEx — removes hooks on Stop",
+    "user32!GetLastInputInfo — system idle fail-safe fallback",
+    "kernel32!GetTickCount64 — monotonic timer for idle measurement",
+    "xinput1_4.dll / xinput9_1_0.dll / xinput1_3.dll — XInput gamepad state polling"
+  ],
+  "invariants": [
+    "_lastPhysicalInputMilliseconds is updated atomically via Interlocked on every genuine physical event",
+    "SuppressInjected and GamepadEnabled are volatile — writes from UI thread are immediately visible in hook/timer callbacks",
+    "Hook repair retries are rate-limited to once per 30 seconds"
+  ],
+  "gotchas": [
+    "GetIdleMilliseconds returns the SMALLER of hook-based idle and system idle (GetLastInputInfo) when UseSystemIdleFailSafe is true — this prevents the app from launching when the OS sees recent activity that hooks may have missed",
+    "XInput fallback tries xinput1_4 → xinput9_1_0 → xinput1_3 at runtime; sets _xinput=None if all are absent so future calls are cheap no-ops",
+    "Gamepad deadzone comparison uses squared magnitude to avoid sqrt; thresholds match Microsoft XInput.h defaults",
+    "Hooks run in a global Windows hook context — any exception inside the callback is caught, logged once, and the hook continues in a degraded state rather than crashing"
+  ]
+}

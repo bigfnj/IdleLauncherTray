@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/DeletionHelper.cs",
+  "sha1": "b6cb95324f2fbe89270900750835b00956f64a81",
+  "purpose": "Deferred folder deletion used during uninstall; spawns a child process that waits for the parent to exit before recursively deleting the target folder.",
+  "exports": ["DeletionHelper.ScheduleFolderDelete", "DeletionHelper.TryRunCleanupFromCommandLine"],
+  "imports": ["System", "System.Diagnostics", "System.IO", "System.Threading"],
+  "called_by": ["Program.cs — TryRunCleanupFromCommandLine on startup", "TrayAppContext.cs — ScheduleFolderDelete on uninstall"],
+  "calls_out_to": ["Process.Start — launches child cleanup helper", "Process.GetProcessById / WaitForExit — waits for parent to terminate"],
+  "invariants": [
+    "IsSafeDeleteTarget refuses any path that equals the filesystem root (prevents deleting C:\\)",
+    "Up to 12 retry attempts with 500ms delays; ClearReadOnlyAttributes is called before each attempt"
+  ],
+  "gotchas": [
+    "The cleanup child process IS the same exe re-invoked with --cleanup-folder args; Program.cs checks for these flags first and exits immediately after cleanup",
+    "Falls back to in-process deletion if child process cannot be started — this may silently fail if the folder is locked by the exiting parent",
+    "Path.GetFullPath is called on the folder argument; malformed paths silently return empty string and are skipped"
+  ]
+}
