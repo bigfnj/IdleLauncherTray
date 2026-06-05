@@ -49,3 +49,5 @@ Thumbs.db
 AGENTS.md
 .github/copilot-instructions.md
 CLAUDE.md
+
+SESSION_LOG*.md
