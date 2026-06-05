@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/AppConfig.cs",
+  "sha1": "f3eff6c1d01d25fa4aaf50b597bcc9908370625b",
+  "purpose": "Data model for all user-configurable settings; serialized to/from config.json via ConfigManager.",
+  "exports": ["AppConfig", "AppConfig.NormalizeCpuThresholdPercent"],
+  "imports": [],
+  "called_by": ["ConfigManager.cs", "TrayAppContext.cs", "PhysicalIdle.cs"],
+  "calls_out_to": [],
+  "invariants": [
+    "CpuThresholdPercent is always one of {10, 20, 30, 40, 50} after normalization",
+    "IdleMinutes >= 1 after normalization",
+    "MinimumSystemIdleFailSafeWindowMs = 6000 is a lower bound enforced by ConfigManager"
+  ],
+  "gotchas": [
+    "NormalizeCpuThresholdPercent rounds to nearest 10 — 15 becomes 20, 14 becomes 10; callers must use this before storing",
+    "AppArguments and TrayIconPath are intentionally NOT validated here; TargetFilePolicy owns path validation"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/IdleLauncherTray.csproj",
+  "sha1": "50432774fafb5298cb2eb036bf605a7173ffca1a",
+  "purpose": "MSBuild project file configuring the .NET 10 WinForms tray app: target framework, output type, assembly metadata, and publish profile references.",
+  "exports": [],
+  "imports": [],
+  "called_by": [],
+  "calls_out_to": [],
+  "invariants": [
+    "OutputType=WinExe — no console window",
+    "TargetFramework=net10.0-windows",
+    "Publish profile produces a single-file framework-dependent win-x64 exe"
+  ],
+  "gotchas": [
+    "UseWindowsForms must be true for NotifyIcon and WinForms dialogs to work"
+  ]
+}

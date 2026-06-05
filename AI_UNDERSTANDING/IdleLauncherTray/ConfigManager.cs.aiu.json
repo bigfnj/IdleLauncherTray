@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/ConfigManager.cs",
+  "sha1": "a3b6279f5aebdea7bf0e882e134d2f1519df2eae",
+  "purpose": "Reads and writes AppConfig to/from config.json, normalizing values and returning safe defaults on any failure.",
+  "exports": ["ConfigManager.Load", "ConfigManager.Save"],
+  "imports": ["System", "System.IO", "System.Text.Json"],
+  "called_by": ["TrayAppContext.cs"],
+  "calls_out_to": [
+    "AppConfig.NormalizeCpuThresholdPercent — value clamping",
+    "TargetFilePolicy.NormalizePath / IsSupportedTarget — clears unsupported AppPath on load",
+    "Logger.Warn / Logger.Error — non-fatal error reporting"
+  ],
+  "invariants": [
+    "Load always returns a valid, normalized AppConfig even if the file is missing or corrupt",
+    "Save writes atomically via a .tmp sidecar + File.Move to avoid partial writes"
+  ],
+  "gotchas": [
+    "NormalizeInPlace silently clears AppPath if the extension is not in TargetFilePolicy.SupportedExtensions — hand-editing the config to add an unsupported type will lose the value on next load",
+    "Normalization runs on both Load and Save, so out-of-range values passed to Save are silently corrected"
+  ]
+}

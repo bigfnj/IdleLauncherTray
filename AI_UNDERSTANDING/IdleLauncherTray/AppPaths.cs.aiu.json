@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/AppPaths.cs",
+  "sha1": "8ab68f48900e47323cad3bbb346d348282778cee",
+  "purpose": "Centralized path constants and registry key names for the app's data directory, config file, tray icon, and startup registry entry.",
+  "exports": ["AppPaths.AppName", "AppPaths.BaseDir", "AppPaths.ConfigPath", "AppPaths.TrayIconFile", "AppPaths.CurrentExePath", "AppPaths.LegacyInstalledExePath", "AppPaths.RunRegSubKey", "AppPaths.RunRegValueName"],
+  "imports": ["System", "System.IO"],
+  "called_by": ["ConfigManager.cs", "Logger.cs", "StartupManager.cs", "DeletionHelper.cs", "TrayAppContext.cs"],
+  "calls_out_to": ["Environment.GetFolderPath — resolves %APPDATA%", "Environment.ProcessPath — current exe path"],
+  "invariants": [
+    "BaseDir is always %APPDATA%\\IdleLauncherTray",
+    "CurrentExePath falls back to AppContext.BaseDirectory if ProcessPath is blank"
+  ],
+  "gotchas": [
+    "LegacyInstalledExePath exists only to migrate old startup registry entries pointing at the old self-installed copy in %APPDATA%; do not use it for any other purpose",
+    "CurrentExePath is a computed property (not readonly) so it re-evaluates on each access"
+  ]
+}

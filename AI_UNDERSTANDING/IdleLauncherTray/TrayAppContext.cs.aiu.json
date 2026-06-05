@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/TrayAppContext.cs",
+  "sha1": "7cd0f2d207193faee8ad92201e9d444dec9717d1",
+  "purpose": "Core application context: owns the tray icon, context menu, and 5-second polling loop that evaluates idle+CPU conditions and launches the configured target app.",
+  "exports": ["TrayAppContext"],
+  "imports": ["System", "System.Diagnostics", "System.Drawing", "System.IO", "System.Windows.Forms"],
+  "called_by": ["Program.cs — instantiated and passed to Application.Run"],
+  "calls_out_to": [
+    "PhysicalIdle.Start / Stop / GetIdleMilliseconds / TryRepairHooksIfNeeded — idle tracking",
+    "CpuUsageMonitor.TryNextValue — CPU sampling",
+    "ConfigManager.Load / Save — persistent settings",
+    "StartupManager.GetStartupEnabled / SetStartupEnabled — startup registry",
+    "WorkstationLock.TryLock — post-launch screen lock",
+    "DeletionHelper.ScheduleFolderDelete — uninstall cleanup",
+    "TargetFilePolicy.IsSupportedTarget / GetUnsupportedTargetMessage — target validation",
+    "TextPrompt.Show — user text input dialogs"
+  ],
+  "invariants": [
+    "Armed/disarmed state: disarms after any automatic launch failure; re-arms only when fresh physical input is detected",
+    "10-second minimum cooldown between launches (_lastLaunchUtc)",
+    "WorkstationLock is only applied for idle-triggered launches, never for manual Run Now"
+  ],
+  "gotchas": [
+    "_launchingSerialized and _shutDownSerialized are Interlocked flags preventing re-entrant launches and double-shutdown",
+    "LaunchEvaluation.StateKey is used to debounce tooltip updates — only redrawn when the readiness state actually changes",
+    "Screensaver (.scr) targets automatically receive /s prepended to arguments to start full-screen mode",
+    "Custom tray icon is loaded from AppPaths.TrayIconFile; on load failure the default embedded icon is used silently"
+  ]
+}

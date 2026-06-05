@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "path": "IdleLauncherTray/WorkstationLock.cs",
+  "sha1": "56dde96bd669b6fc833fc913d0741a6ed9baca4d",
+  "purpose": "Thin wrapper around user32 LockWorkStation to lock the Windows session programmatically.",
+  "exports": ["WorkstationLock.TryLock"],
+  "imports": ["System", "System.Runtime.InteropServices"],
+  "called_by": ["TrayAppContext.cs — called after an idle-triggered launched app exits when LockPcOnAppClose is true"],
+  "calls_out_to": ["user32!LockWorkStation — locks the workstation"],
+  "invariants": [
+    "Returns false with a non-empty errorMessage on any failure",
+    "Never throws — all Win32 errors and exceptions are captured and returned via errorMessage"
+  ],
+  "gotchas": [
+    "LockWorkStation requires the calling process to have an interactive session — will silently fail if called from a service context"
+  ]
+}
