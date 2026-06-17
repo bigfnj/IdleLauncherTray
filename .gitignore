@@ -51,3 +51,7 @@ AGENTS.md
 CLAUDE.md
 
 SESSION_LOG*.md
+.codex/
+.cursorrules
+.windsurfrules
+SESSION_*
