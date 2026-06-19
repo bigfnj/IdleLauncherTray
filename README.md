@@ -23,6 +23,26 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## v2.4 highlights
+
+Version 2.4.0 is a production-hardening pass that closes 12 code-review findings with **zero new dependencies** and no behavioral change to the happy path (verified with a clean `dotnet build` and a single-file publish smoke test that still produces exactly one `IdleLauncherTray.exe`). Project version metadata is now `2.4.0`.
+
+Medium-severity fixes:
+- The `TrayAppContext` constructor now wraps its entire init body in try/catch and shuts down cleanly on failure, so a throwing init step can no longer leak the tray icon, menu, hooks, or CPU monitor
+- Tray-icon swaps now detach `NotifyIcon.Icon` before disposing the previous `Icon`, preventing a repaint from hitting a disposed icon
+- `ConfigManager.Save` deletes its `.tmp` staging file in a `finally` block so a crash mid-save can no longer orphan it
+- All state-mutating tray-menu handlers are wrapped so an unexpected exception logs cleanly and surfaces a single dialog instead of escaping to the WinForms message pump
+- The self-delete safety check now requires the cleanup path to exactly match the app's base directory (defense in depth for the `--cleanup-folder` path)
+- Automatic idle-triggered launches now retry once on transient failure (e.g. an AV scanner briefly holding the target file) before disarming
+
+Low-severity fixes:
+- The CPU monitor detects FILETIME counter regression / system-clock jumps and re-baselines instead of returning a garbage reading from unsigned underflow
+- Workstation-lock failures now log the translated Win32 message (e.g. "A required privilege is not held by the client") instead of a bare error code
+- Deferred folder cleanup now logs the spawned child PID, and the child logs the eventual delete result, so silent cleanup failures show up in the log
+- Magic menu-option arrays and balloon-tip length limits were extracted to named constants/fields
+- `LaunchEvaluation` became a sealed `record` for auto equality/hash/ToString
+- The logger caches its resolved log path instead of recomputing it on every write
+
 ## v2.3 highlights
 
 Version 2.3 carries forward the v2.2 hardening work and adds the following production-readiness changes:
@@ -151,7 +171,7 @@ dotnet publish IdleLauncherTray/IdleLauncherTray.csproj \
   -p:PublishTrimmed=false \
   -p:DebugType=embedded \
   -p:DebugSymbols=true \
-  -o publish/IdleLauncherTray-v2.3.0-win-x64-framework-dependent-singlefile
+  -o publish/IdleLauncherTray-v2.4.0-win-x64-framework-dependent-singlefile
 ```
 
 The resulting release is a portable framework-dependent Windows executable. Target machines must already have the .NET 10 desktop runtime installed.
