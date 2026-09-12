@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Must match the product TFM: the code under test is net10.0-windows and
+         pulls in Windows-only APIs (registry, GetSystemTimes, WinForms). -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- CA1707: test method names are deliberately Method_Scenario_Expectation;
+         the underscores are what makes a failing test readable in the runner
+         output. This is the only analyzer rule the test project turns off. -->
+    <NoWarn>$(NoWarn);CA1707</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Every product type is `internal` and the product .csproj is owned by
+         another change, so it cannot grow an InternalsVisibleTo. The tests reach
+         the code under test through the reflection facade in Sut/, which also
+         covers the private members (DeletionHelper.IsSafeDeleteTarget,
+         CpuUsageMonitor's counter state) that no accessibility change would
+         expose anyway. -->
+    <ProjectReference Include="..\IdleLauncherTray\IdleLauncherTray.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

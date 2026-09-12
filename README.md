@@ -23,6 +23,40 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## v2.5 highlights
+
+Version 2.5 is a correctness pass over the idle state machine, driven by two read-only audits. The
+through-line: **this app used to fail silently, in both directions**, and a tray utility that has
+quietly stopped working looks exactly like one that is idle and waiting.
+
+It could silently never launch:
+- If one input hook installed and the other failed, the 30s repair loop reset the idle clock on
+  every attempt, capping measured idle at 30s so no configured threshold above that was reachable
+- A backwards clock change (NTP, VM snapshot, dead CMOS battery) pinned the launch cooldown on for
+  the magnitude of the jump, and because it is persisted to `config.json` it survived restart
+- Any failure to query the tracked process returned "still running" forever, with no attempt cap
+
+It could silently launch when it should not:
+- CPU usage is a *delta* sample but was only taken on the all-checks-passed path, so after a long
+  target run the next reading was a multi-hour average — under the threshold almost always
+- The launcher re-armed on an idle value that had never been measured, then logged that fresh user
+  activity had been observed
+
+Safety and responsiveness:
+- **Block injected input while running** now has a hard 10-minute auto-release, so it cannot lock
+  out anyone using On-Screen Keyboard, eye-gaze, AutoHotkey or Mouse Without Borders. A touch/pen
+  allowlist is included, but the cap is the guarantee — the allowlist cannot be complete
+- `File.Exists` no longer runs on the UI thread every tick; against an unreachable UNC target it
+  froze the tray menu itself
+- Uninstall no longer recreates the folder it just deleted (the logger was resurrecting it)
+- Enabling **Lock PC on App Close** no longer locks the workstation on the spot
+- A crash in a menu handler no longer leaves a ghost tray icon
+- XInput no longer polls four controller slots 4x/second on a machine with no controller
+
+And the project's first automated tests: 184 cases over the pure logic, run by `dotnet test` and
+gated in CI. They do **not** cover the tray, the hooks or launching — `SMOKE_TEST.md` is still the
+only thing that exercises the app as an app.
+
 ## v2.4 highlights
 
 Version 2.4.0 is a production-hardening pass that closes 12 code-review findings with **zero new dependencies** and no behavioral change to the happy path (verified with a clean `dotnet build` and a single-file publish smoke test that still produces exactly one `IdleLauncherTray.exe`). Project version metadata is now `2.4.0`.

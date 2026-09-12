@@ -10,7 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Runs entirely from the system tray (no console window)
 - Detects physical keyboard/mouse idle time while ignoring injected automation input (e.g., `SendKeys`)
 - Monitors system-wide CPU usage
-- Launches `.exe`, `.scr`, or `.bat` files when both idle and CPU conditions are met
+- Launches `.exe`, `.scr`, `.bat`, `.cmd`, `.lnk`, `.msi`, `.ps1`, `.vbs`, `.jar` or `.py`
+  targets when both idle and CPU conditions are met (see `TargetFilePolicy.cs`, which is the
+  single source of truth for this list)
 - Supports optional "Lock PC on close" for automatically locking after an idle-triggered app exits
 - Can block injected input while the launched app is running
 - Can optionally count XInput gamepad activity as user activity
@@ -32,7 +34,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Subsystems
 
 - **PhysicalIdle.cs**: Low-level keyboard/mouse hook integration to track physical user activity independent of automation
-- **CpuUsageMonitor.cs**: Samples system CPU usage via performance counters
+- **CpuUsageMonitor.cs**: Samples system-wide CPU usage via `GetSystemTimes` (NOT performance
+  counters). It is a **delta** sampler: each reading covers the span since the previous call,
+  which is why the tick samples it unconditionally rather than only when a launch is possible
 - **AppConfig.cs & ConfigManager.cs**: Configuration model (idle threshold, CPU threshold, target path, startup mode) persisted to `%APPDATA%\IdleLauncherTray\config.json`
 - **Logger.cs**: Simple file-based logging to `%APPDATA%\IdleLauncherTray\IdleLauncherTray.log`
 - **StartupManager.cs**: Registry read/write for startup entry management
@@ -124,7 +128,14 @@ The app uses low-level keyboard/mouse hooks to distinguish genuine user activity
 The main evaluation loop runs every 5 seconds—a balance between responsiveness and CPU efficiency. Idle timeout values are compared against this cadence.
 
 ### Armed/Disarmed Pattern
-After a failed automatic launch, the app disarms to avoid repeated failed launches in quick succession. Re-arming requires fresh user activity (mouse/keyboard detected).
+After a failed automatic launch, the app disarms to avoid repeated failed launches in quick
+succession. Re-arming requires fresh user activity (mouse/keyboard detected), confirmed over two
+consecutive ticks to avoid flapping at the idle boundary.
+
+That guarantee is enforced by `LaunchEvaluation.IdleMeasured`, and it is load-bearing: the
+evaluation returns early when no target is configured, the target type is unsupported, or the
+target file is missing, and on those paths idle has not been sampled. Re-arming on `!InputIdleOk`
+alone would therefore re-arm on an *unmeasured* value, which is what happened before v2.5.
 
 ### Portable Design
 No installer, no copies to `%APPDATA%`. Startup registry entries point to the executable's current path. If the executable moves, startup must be re-enabled.
@@ -160,7 +171,20 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 
 ## Version
 
-Current version: **2.3.0**
+Current version: **2.5.0**
 
-v2.3 adds production-readiness improvements (graceful launch failure handling, hook retry logic, better logging, etc.) building on v2.2 hardening work.
+The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.csproj`. The release
+workflow derives the shipped assembly version from the git tag instead, so a tagged build always
+matches its tag regardless of what the csproj says.
+
+- **v2.5** — correctness pass over the idle state machine. Fixes several ways the app could
+  silently stop working: an idle clock that could never exceed 30s when one input hook failed, a
+  CPU guard that stopped guarding after any long gap, re-arming without an idle measurement, and a
+  launch cooldown that a backwards clock change could pin on for years *across restarts*. Adds a
+  hard auto-release cap to injected-input blocking so it cannot lock out assistive-technology
+  users, and the project's first automated tests.
+- **v2.4** — production-hardening pass closing 12 code-review findings (disposal ordering, atomic
+  config save, wrapped menu handlers, transient launch retry).
+- **v2.3** — production-readiness improvements: graceful launch failure handling, hook retry logic,
+  better logging, the expanded target-type list.
 

@@ -61,10 +61,113 @@ public static class PhysicalIdle
     // volatile is required so that writes on the UI thread are immediately visible to
     // readers on the callback threads without needing a full memory barrier.
     private static volatile bool _suppressInjected;
+
+    // --- Injected-input suppression safety net ---
+    //
+    // Suppression swallows EVERY event flagged LLKHF_INJECTED / LLMHF_INJECTED. That is the
+    // whole point for SendKeys-style anti-idle tools, but the same flag is set by the
+    // On-Screen Keyboard, Windows Eye Control / Tobii dwell-click, AutoHotkey remaps and
+    // PowerToys Mouse Without Borders. A user whose ONLY input path is one of those cannot
+    // dismiss the screensaver at all until they reach a physical keyboard or mouse.
+    //
+    // THIS CAP IS THE GUARANTEE. After it elapses suppression stops, whatever the caller
+    // does -- it does not depend on the allowlist below, which cannot be complete, nor on
+    // the caller remembering to switch suppression off. Ten minutes is far longer than a
+    // screensaver needs to prove it is running, and short enough that a locked-out user is
+    // not stranded.
+    private const long InjectedSuppressionMaxDurationMs = 10 * 60 * 1000;
+
+    // Monotonic timestamp of the false -> true transition, or NotSuppressing when off.
+    // Re-asserting `SuppressInjected = true` while it is already true deliberately does NOT
+    // refresh this, so a caller that re-applies the setting on a timer (the tray app does,
+    // once per tick) cannot push the deadline out forever.
+    private const long NotSuppressing = long.MinValue;
+    private static long _suppressionStartedMilliseconds = NotSuppressing;
+
+    // Latched by the hook callback once the cap is exceeded. Kept separate from
+    // _suppressInjected so the public property keeps reporting what the caller ASKED for:
+    // clearing the caller's own flag would just make it re-apply the setting on the next
+    // tick (and log a state change every time), defeating the guarantee.
+    private static int _suppressionAutoReleased;
+
     public static bool SuppressInjected
     {
         get => _suppressInjected;
-        set => _suppressInjected = value;
+        set
+        {
+            if (!value)
+            {
+                _suppressInjected = false;
+                Interlocked.Exchange(ref _suppressionStartedMilliseconds, NotSuppressing);
+                Interlocked.Exchange(ref _suppressionAutoReleased, 0);
+                return;
+            }
+
+            if (_suppressInjected)
+            {
+                // Already armed: re-asserting must not restart the clock.
+                return;
+            }
+
+            // Publish the deadline (and clear the latch) BEFORE the flag, so a callback
+            // that observes _suppressInjected == true always sees a valid start time.
+            Interlocked.Exchange(ref _suppressionStartedMilliseconds, GetMonotonicMilliseconds());
+            Interlocked.Exchange(ref _suppressionAutoReleased, 0);
+            Interlocked.Exchange(ref _pendingSuppressionAutoReleaseLog, 0);
+            _suppressInjected = true;
+        }
+    }
+
+    // Best-effort allowlist for injected input that is a real person on an assistive or
+    // remote input path rather than an anti-idle script.
+    //
+    // THIS CANNOT BE COMPLETE, and it is not meant to be. Windows exposes no reliable
+    // signature for the On-Screen Keyboard, Eye Control, AutoHotkey or Mouse Without
+    // Borders: they all look exactly like SendInput because that is what they call. Only
+    // the touch/pen injection signature (MI_WP_SIGNATURE) is documented, so that is the
+    // only thing that can be matched here. InjectedSuppressionMaxDurationMs above exists
+    // precisely because this list will miss real users.
+    private const ulong InjectedSignatureMask = 0xFFFFFF00;
+    private const ulong TouchOrPenSignature = 0xFF515700;
+
+    private static bool IsAllowlistedInjectedSource(IntPtr dwExtraInfo)
+    {
+        // ToInt64 sign-extends on x86, but the mask keeps only bits 8..31, so the
+        // comparison is identical on both architectures.
+        var extraInfo = unchecked((ulong)dwExtraInfo.ToInt64());
+        return (extraInfo & InjectedSignatureMask) == TouchOrPenSignature;
+    }
+
+    // Hot path: this runs inside the low-level hook callbacks, which block ALL system input
+    // until they return. Ordered cheapest-first, so the common cases (suppression off, or
+    // already auto-released) cost a single volatile read and no 64-bit clock arithmetic.
+    private static bool ShouldSuppressInjected(IntPtr dwExtraInfo)
+    {
+        if (!_suppressInjected)
+        {
+            return false;
+        }
+
+        if (Volatile.Read(ref _suppressionAutoReleased) != 0)
+        {
+            return false;
+        }
+
+        var startedMs = Interlocked.Read(ref _suppressionStartedMilliseconds);
+        if (startedMs != NotSuppressing
+            && GetMonotonicMilliseconds() - startedMs >= InjectedSuppressionMaxDurationMs)
+        {
+            if (Interlocked.Exchange(ref _suppressionAutoReleased, 1) == 0)
+            {
+                // Logging here would do synchronous file I/O under a global lock on the
+                // input path. Stage it for the tick drain so it is emitted exactly once.
+                Interlocked.Exchange(ref _pendingSuppressionAutoReleaseLog, 1);
+            }
+
+            return false;
+        }
+
+        return !IsAllowlistedInjectedSource(dwExtraInfo);
     }
 
     private static volatile bool _ignoreScrollLock = true;
@@ -88,22 +191,31 @@ public static class PhysicalIdle
     public static int LastKeyboardHookError { get; private set; }
     public static int LastMouseHookError { get; private set; }
 
-    public static bool KeyboardHookInstalled => _kbHook != IntPtr.Zero;
-    public static bool MouseHookInstalled => _msHook != IntPtr.Zero;
+    // Read from outside _hookInstallLock (tray UI, tick timer), so the reads are volatile to
+    // pair with the Volatile.Write publishes in the install/uninstall paths.
+    public static bool KeyboardHookInstalled => Volatile.Read(ref _kbHook) != IntPtr.Zero;
+    public static bool MouseHookInstalled => Volatile.Read(ref _msHook) != IntPtr.Zero;
     private static bool HooksFullyInstalled => KeyboardHookInstalled && MouseHookInstalled;
 
     // Store monotonic milliseconds instead of wall-clock DateTime values so idle
     // measurements remain accurate across clock adjustments and still support atomic
     // reads/writes via Interlocked.
     private static long _lastPhysicalInputMilliseconds = GetMonotonicMilliseconds();
-    private static long _lastInjectedKeyMilliseconds = long.MinValue;
-    private static int _lastInjectedVkCode;
+
+    // VK code and timestamp of the last injected keystroke, packed into one 64-bit slot:
+    // vkCode in the high 32 bits, the low 32 bits of the monotonic clock in the low 32.
+    // These used to be two fields written by two separate Interlocked.Exchange calls and
+    // read back as a pair, so a reader could pair a fresh timestamp with the PREVIOUS
+    // key's VK code and misclassify a real keystroke as an ignorable anti-idle toggle.
+    // One exchange makes the pair atomic.
+    private const long NoInjectedKey = long.MinValue;
+    private static long _lastInjectedKey = NoInjectedKey;
 
     private static IntPtr _kbHook = IntPtr.Zero;
     private static IntPtr _msHook = IntPtr.Zero;
 
-    private static LowLevelKeyboardProc _kbProc = KeyboardHookCallback;
-    private static LowLevelMouseProc _msProc = MouseHookCallback;
+    private static readonly LowLevelKeyboardProc _kbProc = KeyboardHookCallback;
+    private static readonly LowLevelMouseProc _msProc = MouseHookCallback;
 
     // Explicit type to avoid ambiguity with System.Windows.Forms.Timer (global usings when WinForms is enabled).
     private static System.Threading.Timer? _gamepadTimer;
@@ -118,9 +230,37 @@ public static class PhysicalIdle
     private static int _mouseHookExceptionLogged;
     private static long _lastHookInstallAttemptMilliseconds = long.MinValue;
 
+    // Hook callbacks must never call Logger: it does synchronous File.AppendAllText under a
+    // global lock, and the callback blocks all system input until it returns. They stage a
+    // message/flag here instead and DrainDeferredHookLogs() emits it from the tray app's
+    // tick, which is the only entry point into PhysicalIdle that is called periodically.
+    private static string? _pendingKeyboardHookExceptionMessage;
+    private static string? _pendingMouseHookExceptionMessage;
+    private static int _pendingSuppressionAutoReleaseLog;
+
+    // Cached after the first successful resolution: EnsureHooksStarted runs every 30s while
+    // a hook is missing, and Process.MainModule is an expensive way to learn something that
+    // cannot change for the lifetime of the process. Only touched under _hookInstallLock.
+    private static IntPtr _cachedModuleHandle = IntPtr.Zero;
+
     private static bool[] _gpConnected = new bool[4];
     private static uint[] _gpLastPacket = new uint[4];
     private static XINPUT_GAMEPAD[] _gpLastState = new XINPUT_GAMEPAD[4];
+
+    // A disconnected XInput slot still costs a full device enumeration on every poll, so at
+    // the default 250 ms cadence an empty rig burns 16 enumerations per second forever --
+    // and GamepadCountsAsActivity defaults to true, so that IS the default. Back empty slots
+    // off; connected slots keep the responsive cadence.
+    private const int GamepadDisconnectedRetryMinMs = 2000;
+    private const int GamepadDisconnectedRetryMaxMs = 4000;
+
+    private static readonly long[] _gpNextPollMilliseconds = new long[4];
+    private static readonly int[] _gpDisconnectedBackoffMs = new int[4];
+
+    // Bounded wait for an in-flight gamepad callback to finish. The gamepad timer is stopped
+    // from the UI thread, which is also the hook thread, so an unbounded wait on a hung
+    // XInputGetState would stall the message pump and every low-level hook callback with it.
+    private const int GamepadTimerDisposeWaitMs = 2000;
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
     private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -163,12 +303,12 @@ public static class PhysicalIdle
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
-    [DllImport("kernel32.dll")]
-    private static extern ulong GetTickCount64();
-
+    // Environment.TickCount64 IS GetTickCount64 -- same counter, same resolution -- but the
+    // JIT expands it inline, so it costs no P/Invoke transition. That matters because this
+    // is called from the low-level hook callbacks, on the system input path.
     private static long GetMonotonicMilliseconds()
     {
-        return unchecked((long)GetTickCount64());
+        return Environment.TickCount64;
     }
 
     private static double GetSystemIdleMilliseconds()
@@ -185,11 +325,11 @@ public static class PhysicalIdle
                 return double.PositiveInfinity;
             }
 
-            // GetTickCount64 avoids the 49-day wraparound of GetTickCount.
-            // LASTINPUTINFO.dwTime is still 32-bit, so mask GetTickCount64 to compare correctly.
-            var tick64 = GetTickCount64();
+            // The 64-bit tick count avoids the 49-day wraparound of GetTickCount.
+            // LASTINPUTINFO.dwTime is still 32-bit, so mask it down to compare correctly.
+            var tick64 = GetMonotonicMilliseconds();
             var lastInput32 = lii.dwTime;
-            var tick32 = (uint)(tick64 & 0xFFFFFFFF);
+            var tick32 = unchecked((uint)tick64);
             var idle = unchecked(tick32 - lastInput32); // handles 32-bit wraparound
             return idle;
         }
@@ -210,19 +350,30 @@ public static class PhysicalIdle
         return Math.Max(configured, AppConfig.MinimumSystemIdleFailSafeWindowMs);
     }
 
+    // Packs the pair written by the keyboard hook. vkCode is masked to 16 bits (its source
+    // is the WORD KBDLLHOOKSTRUCT.vkCode) so the packed value can never collide with the
+    // NoInjectedKey sentinel, whatever an injector puts in the field.
+    private static long PackInjectedKey(uint vkCode, long nowMs)
+    {
+        return ((long)(vkCode & 0xFFFF) << 32) | unchecked((uint)nowMs);
+    }
+
     private static bool ShouldIgnoreSystemIdleSample(long nowMs, double systemIdleMs, int effectiveWindowMs)
     {
-        var lastInjMs = Interlocked.Read(ref _lastInjectedKeyMilliseconds);
-        if (lastInjMs == long.MinValue)
+        var lastInjected = Interlocked.Read(ref _lastInjectedKey);
+        if (lastInjected == NoInjectedKey)
         {
             return false;
         }
 
-        var injectedAgeMs = (double)Math.Max(0, nowMs - lastInjMs);
+        // Unsigned 32-bit subtraction, so the age stays correct across the ~49.7-day
+        // wraparound of the low half of the tick count.
+        var ageMs = unchecked((uint)nowMs - (uint)lastInjected);
+        var injectedAgeMs = (double)ageMs;
         var idleDeltaMs = Math.Abs(injectedAgeMs - systemIdleMs);
         return injectedAgeMs <= effectiveWindowMs + 250
             && idleDeltaMs <= 750
-            && IsIgnoredInjectedKey(unchecked((uint)Interlocked.CompareExchange(ref _lastInjectedVkCode, 0, 0)));
+            && IsIgnoredInjectedKey(unchecked((uint)(lastInjected >> 32)));
     }
 
     private static bool IsIgnoredInjectedKey(uint vkCode)
@@ -359,10 +510,12 @@ public static class PhysicalIdle
         }
     }
 
-    [DllImport("user32.dll", SetLastError = true)]
+    // CharSet.Unicode selects SetWindowsHookExW. There are no string parameters, so this only
+    // affects which export is bound; the W form is the correct one to target.
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
-    [DllImport("user32.dll", SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -392,7 +545,33 @@ public static class PhysicalIdle
 
     public static void TryRepairHooksIfNeeded()
     {
+        DrainDeferredHookLogs();
         EnsureHooksStarted(forceImmediateRetry: false);
+    }
+
+    // Emits whatever the hook callbacks staged instead of logging inline. This is called
+    // from TryRepairHooksIfNeeded() because that is the one PhysicalIdle entry point the
+    // tray app already calls on every tick: PhysicalIdle owns no timer of its own once
+    // gamepad polling is off, so there is nowhere else to drain from without a timer that
+    // exists only to log.
+    private static void DrainDeferredHookLogs()
+    {
+        var keyboardMessage = Interlocked.Exchange(ref _pendingKeyboardHookExceptionMessage, null);
+        if (keyboardMessage != null)
+        {
+            Logger.Warn($"Keyboard hook callback failed. Input will be passed through and idle tracking will continue in a degraded state. Error='{keyboardMessage}'.");
+        }
+
+        var mouseMessage = Interlocked.Exchange(ref _pendingMouseHookExceptionMessage, null);
+        if (mouseMessage != null)
+        {
+            Logger.Warn($"Mouse hook callback failed. Input will be passed through and idle tracking will continue in a degraded state. Error='{mouseMessage}'.");
+        }
+
+        if (Interlocked.Exchange(ref _pendingSuppressionAutoReleaseLog, 0) != 0)
+        {
+            Logger.Warn($"Injected input suppression auto-released after {InjectedSuppressionMaxDurationMs / 1000} seconds and injected input is being passed through again. This safety net exists so a user whose only input path is injected (On-Screen Keyboard, eye control, AutoHotkey, Mouse Without Borders) cannot be locked out of the desktop. Suppression re-arms the next time it is switched off and back on.");
+        }
     }
 
     private static void EnsureHooksStarted(bool forceImmediateRetry)
@@ -426,17 +605,36 @@ public static class PhysicalIdle
             // try to provide a module handle, but fall back to IntPtr.Zero if unavailable.
             var hMod = TryGetCurrentModuleHandle();
 
-            if (_kbHook == IntPtr.Zero)
+            var keyboardWasInstalled = _kbHook != IntPtr.Zero;
+            var mouseWasInstalled = _msHook != IntPtr.Zero;
+
+            if (!keyboardWasInstalled)
             {
                 InstallKeyboardHook(hMod);
             }
 
-            if (_msHook == IntPtr.Zero)
+            if (!mouseWasInstalled)
             {
                 InstallMouseHook(hMod);
             }
 
-            if (_kbHook != IntPtr.Zero || _msHook != IntPtr.Zero)
+            // Reset the idle clock ONLY when a hook was newly installed on this attempt.
+            //
+            // A freshly installed hook has no input history, so treating "now" as the last
+            // physical input is the conservative choice -- it avoids claiming the user was idle
+            // through a period we were not actually watching.
+            //
+            // The previous condition was `_kbHook != Zero || _msHook != Zero`, which is satisfied
+            // by an ALREADY-installed hook. With one hook installed and the other permanently
+            // failing, HooksFullyInstalled never becomes true, so this body ran every 30s and the
+            // surviving hook reset the clock every time. Measured idle was pinned below 30s
+            // forever and no configured threshold above that was ever reachable: the app looked
+            // healthy and silently never launched.
+            var newlyInstalledAnyHook =
+                (!keyboardWasInstalled && _kbHook != IntPtr.Zero)
+                || (!mouseWasInstalled && _msHook != IntPtr.Zero);
+
+            if (newlyInstalledAnyHook)
             {
                 Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, nowMs);
             }
@@ -445,6 +643,12 @@ public static class PhysicalIdle
 
     private static IntPtr TryGetCurrentModuleHandle()
     {
+        // Only ever called under _hookInstallLock, so a plain field read/write is enough.
+        if (_cachedModuleHandle != IntPtr.Zero)
+        {
+            return _cachedModuleHandle;
+        }
+
         try
         {
             using var currentProcess = Process.GetCurrentProcess();
@@ -452,7 +656,10 @@ public static class PhysicalIdle
 
             if (!string.IsNullOrWhiteSpace(moduleName))
             {
-                return GetModuleHandle(moduleName);
+                // Cache successes only; a failure may be transient and is cheap to retry
+                // at the 30s repair cadence.
+                _cachedModuleHandle = GetModuleHandle(moduleName);
+                return _cachedModuleHandle;
             }
         }
         catch
@@ -465,16 +672,16 @@ public static class PhysicalIdle
     private static void InstallKeyboardHook(IntPtr hMod)
     {
         LastKeyboardHookError = 0;
-        _kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, _kbProc, hMod, 0);
+        var hook = SetWindowsHookEx(WH_KEYBOARD_LL, _kbProc, hMod, 0);
 
-        if (_kbHook == IntPtr.Zero)
+        if (hook == IntPtr.Zero)
         {
             LastKeyboardHookError = Marshal.GetLastWin32Error();
 
             // Some hosts (in-memory assemblies) behave better with a null module handle.
-            _kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, _kbProc, IntPtr.Zero, 0);
+            hook = SetWindowsHookEx(WH_KEYBOARD_LL, _kbProc, IntPtr.Zero, 0);
 
-            if (_kbHook == IntPtr.Zero)
+            if (hook == IntPtr.Zero)
             {
                 LastKeyboardHookError = Marshal.GetLastWin32Error();
             }
@@ -483,19 +690,23 @@ public static class PhysicalIdle
                 LastKeyboardHookError = 0;
             }
         }
+
+        // Publish with a release write: KeyboardHookInstalled and the hook callback both
+        // read _kbHook outside _hookInstallLock. Stop() already writes it this way.
+        Volatile.Write(ref _kbHook, hook);
     }
 
     private static void InstallMouseHook(IntPtr hMod)
     {
         LastMouseHookError = 0;
-        _msHook = SetWindowsHookEx(WH_MOUSE_LL, _msProc, hMod, 0);
+        var hook = SetWindowsHookEx(WH_MOUSE_LL, _msProc, hMod, 0);
 
-        if (_msHook == IntPtr.Zero)
+        if (hook == IntPtr.Zero)
         {
             LastMouseHookError = Marshal.GetLastWin32Error();
-            _msHook = SetWindowsHookEx(WH_MOUSE_LL, _msProc, IntPtr.Zero, 0);
+            hook = SetWindowsHookEx(WH_MOUSE_LL, _msProc, IntPtr.Zero, 0);
 
-            if (_msHook == IntPtr.Zero)
+            if (hook == IntPtr.Zero)
             {
                 LastMouseHookError = Marshal.GetLastWin32Error();
             }
@@ -504,6 +715,8 @@ public static class PhysicalIdle
                 LastMouseHookError = 0;
             }
         }
+
+        Volatile.Write(ref _msHook, hook);
     }
 
     public static void Stop()
@@ -530,15 +743,22 @@ public static class PhysicalIdle
 
     public static void SetGamepadEnabled(bool enabled)
     {
-        GamepadEnabled = enabled;
+        // Same lock Start()/Stop() hold, for the same reason: without it a menu toggle can
+        // interleave with Stop() and leave a gamepad timer polling after teardown, still
+        // writing _lastPhysicalInputMilliseconds. Lock order is _hookInstallLock ->
+        // _gamepadLock (Start/StopGamepadTimer take _gamepadLock); do not invert it.
+        lock (_hookInstallLock)
+        {
+            GamepadEnabled = enabled;
 
-        if (enabled)
-        {
-            StartGamepadTimer();
-        }
-        else
-        {
-            StopGamepadTimer();
+            if (enabled)
+            {
+                StartGamepadTimer();
+            }
+            else
+            {
+                StopGamepadTimer();
+            }
         }
     }
 
@@ -613,8 +833,9 @@ public static class PhysicalIdle
 
                 if (injected)
                 {
-                    Interlocked.Exchange(ref _lastInjectedKeyMilliseconds, GetMonotonicMilliseconds());
-                    Interlocked.Exchange(ref _lastInjectedVkCode, unchecked((int)data.vkCode));
+                    Interlocked.Exchange(
+                        ref _lastInjectedKey,
+                        PackInjectedKey(data.vkCode, GetMonotonicMilliseconds()));
                 }
 
                 if (!injected && !(IgnoreScrollLock && isScroll))
@@ -622,7 +843,7 @@ public static class PhysicalIdle
                     Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, GetMonotonicMilliseconds());
                 }
 
-                if (injected && SuppressInjected)
+                if (injected && ShouldSuppressInjected(data.dwExtraInfo))
                 {
                     return (IntPtr)1; // swallow injected keypress
                 }
@@ -634,11 +855,13 @@ public static class PhysicalIdle
             {
                 try
                 {
-                    Logger.Warn($"Keyboard hook callback failed. Input will be passed through and idle tracking will continue in a degraded state. Error='{ex.Message}'.");
+                    // Stage the message; DrainDeferredHookLogs() writes it from the tick.
+                    // Logging here would block all system input on a file write.
+                    Interlocked.Exchange(ref _pendingKeyboardHookExceptionMessage, ex.Message);
                 }
                 catch
                 {
-                    // Ignore logging failures inside the hook callback.
+                    // Never let diagnostics escape into the input path.
                 }
             }
         }
@@ -662,7 +885,7 @@ public static class PhysicalIdle
                     Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, GetMonotonicMilliseconds());
                 }
 
-                if (injected && SuppressInjected)
+                if (injected && ShouldSuppressInjected(data.dwExtraInfo))
                 {
                     return (IntPtr)1; // swallow injected mouse event
                 }
@@ -674,11 +897,13 @@ public static class PhysicalIdle
             {
                 try
                 {
-                    Logger.Warn($"Mouse hook callback failed. Input will be passed through and idle tracking will continue in a degraded state. Error='{ex.Message}'.");
+                    // Stage the message; DrainDeferredHookLogs() writes it from the tick.
+                    // Logging here would block all system input on a file write.
+                    Interlocked.Exchange(ref _pendingMouseHookExceptionMessage, ex.Message);
                 }
                 catch
                 {
-                    // Ignore logging failures inside the hook callback.
+                    // Never let diagnostics escape into the input path.
                 }
             }
         }
@@ -716,6 +941,11 @@ public static class PhysicalIdle
                 _gpConnected[i] = false;
                 _gpLastPacket[i] = 0;
                 _gpLastState[i] = default;
+
+                // Zero, not "now + backoff": every slot is probed once on the first poll so a
+                // controller that is already plugged in is picked up immediately.
+                _gpNextPollMilliseconds[i] = 0;
+                _gpDisconnectedBackoffMs[i] = 0;
             }
 
             // Ensure array writes are visible to the timer callback thread before it starts.
@@ -751,15 +981,29 @@ public static class PhysicalIdle
             }
         }
 
+        var disposedEvent = new ManualResetEvent(false);
+        var disposeEventHere = true;
+
         try
         {
-            using var disposedEvent = new ManualResetEvent(false);
-            // Wait indefinitely for the in-flight callback to finish. The callback checks
+            // Bounded wait for the in-flight callback. The callback checks
             // _gamepadStopRequested on entry and _gamepadPollInProgress prevents re-entry,
-            // so it should exit promptly unless XInput itself is hung (which we can't fix).
+            // so it normally exits at once -- but this runs on the UI thread, which is also
+            // the hook thread, and a hung XInputGetState would otherwise stall the message
+            // pump and every low-level hook callback with it. Give up and carry on instead.
             if (timerToDispose.Dispose(disposedEvent))
             {
-                disposedEvent.WaitOne();
+                if (!disposedEvent.WaitOne(GamepadTimerDisposeWaitMs))
+                {
+                    // The timer still owns this handle and will signal it when the callback
+                    // finally returns, so disposing it now would leave the runtime setting a
+                    // closed handle. Deliberately leak one event rather than risk that; it
+                    // can only happen once per stop, and only when XInput is already hung.
+                    disposeEventHere = false;
+
+                    Logger.Warn(
+                        $"Gamepad poll did not finish within {GamepadTimerDisposeWaitMs} ms of the timer being stopped; continuing without waiting. XInputGetState is most likely blocked in a driver.");
+                }
             }
         }
         catch (ObjectDisposedException)
@@ -768,6 +1012,11 @@ public static class PhysicalIdle
         }
         finally
         {
+            if (disposeEventHere)
+            {
+                disposedEvent.Dispose();
+            }
+
             Interlocked.Exchange(ref _gamepadPollInProgress, 0);
         }
     }
@@ -791,6 +1040,8 @@ public static class PhysicalIdle
                 return;
             }
 
+            var nowMs = GetMonotonicMilliseconds();
+
             for (uint i = 0; i < 4; i++)
             {
                 if (Interlocked.CompareExchange(ref _gamepadStopRequested, 0, 0) != 0)
@@ -798,10 +1049,21 @@ public static class PhysicalIdle
                     return;
                 }
 
+                // Slots that were empty last time are only re-probed when their backoff
+                // expires. Connected slots are never skipped, so input latency is unchanged
+                // for anyone who actually has a controller.
+                if (!_gpConnected[i] && nowMs < _gpNextPollMilliseconds[i])
+                {
+                    continue;
+                }
+
                 var rc = XInputGetStateSafe(i, out var state);
 
                 if (rc == ERROR_SUCCESS)
                 {
+                    _gpNextPollMilliseconds[i] = 0;
+                    _gpDisconnectedBackoffMs[i] = 0;
+
                     if (!_gpConnected[i])
                     {
                         _gpConnected[i] = true;
@@ -824,6 +1086,13 @@ public static class PhysicalIdle
                 else
                 {
                     _gpConnected[i] = false;
+
+                    var backoffMs = _gpDisconnectedBackoffMs[i] == 0
+                        ? GamepadDisconnectedRetryMinMs
+                        : Math.Min(_gpDisconnectedBackoffMs[i] * 2, GamepadDisconnectedRetryMaxMs);
+
+                    _gpDisconnectedBackoffMs[i] = backoffMs;
+                    _gpNextPollMilliseconds[i] = nowMs + backoffMs;
                 }
             }
         }

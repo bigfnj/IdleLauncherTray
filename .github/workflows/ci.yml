@@ -6,9 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Floor for the number of tests that must actually execute. `dotnet test` reports
+  # success for a run that discovered nothing, so without this a broken or unreferenced
+  # test project would turn CI green by testing zero things.
+  MINIMUM_TESTS: 150
+
 jobs:
   build:
-    name: Build & Publish Smoke Test
+    name: Build, Test & Publish Smoke Test
     runs-on: windows-latest
 
     steps:
@@ -25,6 +31,24 @@ jobs:
 
       - name: Build (Release)
         run: dotnet build IdleLauncherTray.sln --configuration Release --no-restore
+
+      - name: Test
+        # Placed before publish on purpose: a failing step fails the job and every later
+        # step is skipped, so a red suite means nothing gets published or tagged.
+        shell: pwsh
+        run: |
+          $log = [System.IO.Path]::GetTempFileName()
+          dotnet test IdleLauncherTray.sln --configuration Release --no-build | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "dotnet test failed." }
+
+          $summary = Select-String -Path $log -Pattern 'Passed:\s+(\d+)' | Select-Object -First 1
+          if (-not $summary) { throw "No dotnet test summary was produced - did any tests run at all?" }
+
+          $passed = [int]$summary.Matches[0].Groups[1].Value
+          Write-Host "Tests executed: $passed (minimum $env:MINIMUM_TESTS)"
+          if ($passed -lt [int]$env:MINIMUM_TESTS) {
+            throw "Only $passed tests ran but at least $env:MINIMUM_TESTS are expected. Tests have been dropped from the run."
+          }
 
       - name: Publish smoke test (single-file, framework-dependent)
         # Verifies the publish profile still produces a single EXE — catches

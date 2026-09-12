@@ -75,14 +75,14 @@ internal sealed class CpuUsageMonitor
             return false;
         }
 
-        // kernel includes idle time. Clamp anomalies conservatively rather than underflowing.
+        // kernel includes idle time. Clamping busy here is THE bound on the result, and it is
+        // why no second clamp follows: `busy` is at most `total`, so `pct` is at most exactly
+        // 100.0 (reached when the window contained no idle time at all) and can never exceed it.
+        // A trailing `if (pct > 100) pct = 100;` used to sit below this; it could not fire under
+        // any input and read as a live safety net while being nothing of the kind. If you ever
+        // relax the line below, that is the moment an upper clamp becomes necessary again.
         var busy = idleDelta >= total ? 0UL : total - idleDelta;
         var pct = (busy * 100.0) / total;
-
-        if (pct > 100)
-        {
-            pct = 100;
-        }
 
         percent = (float)pct;
         return true;

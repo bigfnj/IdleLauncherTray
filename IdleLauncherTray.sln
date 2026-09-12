@@ -4,6 +4,8 @@ VisualStudioVersion = 18.6.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "IdleLauncherTray", "IdleLauncherTray\IdleLauncherTray.csproj", "{86E88064-6EC4-49FE-9593-4EEDFDDA6864}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "IdleLauncherTray.Tests", "IdleLauncherTray.Tests\IdleLauncherTray.Tests.csproj", "{A4FD982F-B042-4E82-9D83-5B918159F1A7}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,6 +16,10 @@ Global
 		{86E88064-6EC4-49FE-9593-4EEDFDDA6864}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{86E88064-6EC4-49FE-9593-4EEDFDDA6864}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{86E88064-6EC4-49FE-9593-4EEDFDDA6864}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A4FD982F-B042-4E82-9D83-5B918159F1A7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A4FD982F-B042-4E82-9D83-5B918159F1A7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A4FD982F-B042-4E82-9D83-5B918159F1A7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A4FD982F-B042-4E82-9D83-5B918159F1A7}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

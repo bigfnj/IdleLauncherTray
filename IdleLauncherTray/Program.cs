@@ -59,6 +59,11 @@ internal static class Program
         {
             try { Logger.Error("Unhandled UI thread exception.", e.Exception); } catch { /* ignore */ }
 
+            // Clear the tray icon BEFORE Environment.Exit below. That call does not run
+            // ApplicationContext teardown, so without this the icon lingers in the notification
+            // area as a ghost until the user hovers it.
+            TrayAppContext.EmergencyHideTrayIcon();
+
             try
             {
                 MessageBox.Show(
@@ -78,6 +83,8 @@ internal static class Program
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
             try { Logger.Error("Unhandled non-UI exception.", e.ExceptionObject as Exception); } catch { /* ignore */ }
+
+            TrayAppContext.EmergencyHideTrayIcon();
         };
 
         try

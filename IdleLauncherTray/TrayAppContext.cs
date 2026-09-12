@@ -1,10 +1,9 @@
-using System;
-using System.Collections.Generic;
+// System, System.Collections.Generic, System.Drawing, System.IO and System.Windows.Forms are
+// supplied by ImplicitUsings + UseWindowsForms in the csproj, so they are not repeated here.
+// Only these two need declaring. (IDE0005 is not enabled at build, so the analyzers do not
+// report the redundant ones.)
 using System.Diagnostics;
-using System.Drawing;
 using System.Globalization;
-using System.IO;
-using System.Windows.Forms;
 
 namespace IdleLauncherTray;
 
@@ -66,6 +65,19 @@ internal sealed class TrayAppContext : ApplicationContext
     private bool? _lastSuppressionState;
     private bool _trackedProcessWasIdleLaunch;
 
+    // Consecutive failures of the tracked-process state query. Bounded so one bad handle cannot
+    // latch the launcher off for the life of the process (see UpdateTrackedProcessState).
+    private int _consecutiveProcessQueryFailures;
+    private const int MaxConsecutiveProcessQueryFailures = 3;
+
+    // Cached existence of the configured target. File.Exists ran on the UI thread on every tick;
+    // against an unreachable UNC path (a documented supported target) it blocks for the SMB
+    // timeout and freezes the message pump, so the tray menu itself stops responding.
+    private string _targetExistsCachedPath = string.Empty;
+    private bool _targetExistsCachedResult;
+    private long _targetExistsCheckedAtMs = long.MinValue;
+    private const int TargetExistsCacheTtlMs = 30_000;
+
     // Mutable record (init-style construction via object initializer, then field
     // updates as the evaluation progresses). Record gives us auto-equality and
     // ToString() for free; we keep the explicit Describe() for human-readable logs.
@@ -80,6 +92,13 @@ internal sealed class TrayAppContext : ApplicationContext
         public int IdleSeconds { get; set; }
         public int RequiredIdleSeconds { get; set; }
         public bool InputIdleOk { get; set; }
+
+        // Whether idle was actually SAMPLED this evaluation. The early-return paths (no target,
+        // unsupported, missing) leave InputIdleOk at its initialiser `false`, which is
+        // indistinguishable from a measured "the user is active" -- and the re-arm logic treated
+        // it as exactly that, re-arming with no measurement and then logging that fresh user
+        // activity had been observed. Never infer activity from InputIdleOk alone.
+        public bool IdleMeasured { get; set; }
         public double CpuPercent { get; set; }
         public bool CpuSampleValid { get; set; }
         public int CpuThresholdPercent { get; set; }
@@ -157,6 +176,10 @@ internal sealed class TrayAppContext : ApplicationContext
             Text = AppPaths.AppName,
             Visible = true
         };
+
+        // Publish immediately after the icon exists so the fatal handlers in Program.cs can clear
+        // it. Single-instance is enforced by a named mutex in Main, so there is only ever one.
+        _live = this;
 
         // Tray menu
         _menu = new ContextMenuStrip
@@ -399,7 +422,10 @@ internal sealed class TrayAppContext : ApplicationContext
             _cfg.LockPcOnAppClose = _miLockPcOnAppClose.Checked;
             ConfigManager.Save(_cfg);
 
-            var running = UpdateTrackedProcessState(logStateChange: false);
+            // allowWorkstationLock: false -- see UpdateTrackedProcessState. Without it, ticking
+            // this checkbox locks the workstation immediately whenever the tracked idle-launched
+            // process exited within the last tick.
+            var running = UpdateTrackedProcessState(logStateChange: false, allowWorkstationLock: false);
             if (running && _trackedProcessWasIdleLaunch)
             {
                 Logger.Info(
@@ -585,7 +611,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
-            if (TryLaunchSelectedApp("manual Run Now", launchedFromIdle: false, showErrorDialog: true, out _))
+            if (TryLaunchSelectedApp("manual Run Now", launchedFromIdle: false, showErrorDialog: true, out _, out _))
             {
                 DisarmAfterLaunch("manual Run Now");
             }
@@ -895,20 +921,28 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 if (_armed)
                 {
-                    if (TryLaunchWithTransientRetry("automatic idle trigger", out var failureMessage))
+                    if (TryLaunchWithTransientRetry("automatic idle trigger", out var failureMessage, out var launchAlreadyInProgress))
                     {
                         DisarmAfterLaunch("automatic idle trigger");
                     }
-                    else
+                    else if (!launchAlreadyInProgress)
                     {
                         HandleAutomaticLaunchFailure("automatic idle trigger", evaluation.TargetPath, failureMessage);
                     }
+
+                    // else: a launch is already in flight under a nested pump. Skip this tick
+                    // silently and leave the launcher armed -- the in-flight launch will disarm
+                    // it on success.
                 }
 
                 return;
             }
 
-            if (!_armed && !evaluation.InputIdleOk)
+            // `evaluation.IdleMeasured &&` is load-bearing: without it the three early-return
+            // paths (no target / unsupported / missing) satisfy `!InputIdleOk` by never having
+            // computed it, so a target on a flaky share re-armed the launcher every other tick
+            // while the user was away, and logged that fresh user activity had been observed.
+            if (!_armed && evaluation.IdleMeasured && !evaluation.InputIdleOk)
             {
                 // Require at least 2 consecutive non-idle ticks to confirm genuine user activity
                 // before re-arming. This prevents rapid arm/disarm flapping when the user is
@@ -941,12 +975,34 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             TargetPath = targetPath,
             HasTarget = !string.IsNullOrWhiteSpace(targetPath),
-            RequiredIdleSeconds = Math.Max(1, _cfg.IdleMinutes) * 60,
-            CpuThresholdPercent = Math.Max(0, _cfg.CpuThresholdPercent),
-            CooldownOk = true,
+            // No Math.Max clamps here. ConfigManager.NormalizeInPlace runs on BOTH Load and
+            // Save and is the single enforcement point for these bounds (IdleMinutes >= 1, CPU
+            // threshold snapped to the allowed steps); the menu handlers only ever assign values
+            // from those same fixed sets. Clamping again here could not change any reachable
+            // value and disguised where the invariant is actually kept.
+            RequiredIdleSeconds = _cfg.IdleMinutes * 60,
+            CpuThresholdPercent = _cfg.CpuThresholdPercent,
             InputIdleOk = false,
             CpuOk = false
         };
+
+        // Sample idle and CPU FIRST, before any early return.
+        //
+        // CpuUsageMonitor is a DELTA sampler: each reading covers the span since the previous
+        // call. Sampling only on the all-checks-passed path meant that after a four-hour target
+        // run, or hours with a target on an unreachable share, the next "CPU usage" reading was a
+        // four-hour average rather than a five-second one. A multi-hour average sits under the
+        // 10-50% gate almost always, so the CPU guard quietly stopped guarding at exactly the
+        // moment it mattered: the first evaluation after a gap.
+        //
+        // Measuring idle here too is what lets the re-arm logic below tell "the user is active"
+        // apart from "we never looked".
+        evaluation.IdleSeconds = GetIdleSeconds();
+        evaluation.IdleMeasured = true;
+        evaluation.CpuSampleValid = _cpu.TryNextValue(out var cpuPercent);
+        evaluation.CpuPercent = evaluation.CpuSampleValid ? cpuPercent : 0;
+        evaluation.InputIdleOk = evaluation.IdleSeconds >= evaluation.RequiredIdleSeconds;
+        evaluation.CpuOk = evaluation.CpuSampleValid && evaluation.CpuPercent <= evaluation.CpuThresholdPercent;
 
         if (!evaluation.HasTarget)
         {
@@ -961,22 +1017,32 @@ internal sealed class TrayAppContext : ApplicationContext
             return evaluation;
         }
 
-        evaluation.TargetExists = File.Exists(targetPath);
+        evaluation.TargetExists = TargetExistsCached(targetPath);
         if (!evaluation.TargetExists)
         {
             evaluation.ReasonCode = "SelectedTargetMissing";
             return evaluation;
         }
 
-        evaluation.IdleSeconds = GetIdleSeconds();
-        evaluation.CpuSampleValid = _cpu.TryNextValue(out var cpuPercent);
-        evaluation.CpuPercent = evaluation.CpuSampleValid ? cpuPercent : 0;
-        evaluation.InputIdleOk = evaluation.IdleSeconds >= evaluation.RequiredIdleSeconds;
-        evaluation.CpuOk = evaluation.CpuSampleValid && evaluation.CpuPercent <= evaluation.CpuThresholdPercent;
-
         if (_lastLaunchUtc.HasValue)
         {
             var delta = (DateTime.UtcNow - _lastLaunchUtc.Value).TotalSeconds;
+
+            // A NEGATIVE delta means the wall clock moved backwards relative to the stored
+            // timestamp: an NTP correction, a VM snapshot restore, a dead CMOS battery, or a
+            // hand-edited LastLaunchUtc missing its 'Z' (which ToUniversalTime() then shifts
+            // forward by the local offset). Without this clamp the cooldown stayed active for the
+            // full magnitude of the jump -- hours or years -- and because _lastLaunchUtc is
+            // persisted to config.json it SURVIVED RESTART, with nothing in the tray to show why
+            // the app had stopped launching. Re-baseline and carry on.
+            if (delta < 0)
+            {
+                Logger.Warn(
+                    $"Launch cooldown timestamp is in the future by {(-delta):F0}s (clock change or edited config). Re-baselining to now.");
+                _lastLaunchUtc = DateTime.UtcNow;
+                delta = 0;
+            }
+
             if (delta < MinLaunchCooldownSeconds)
             {
                 evaluation.CooldownOk = false;
@@ -1008,19 +1074,75 @@ internal sealed class TrayAppContext : ApplicationContext
         return evaluation;
     }
 
-    // Retry wrapper for automatic idle-triggered launches. Transient failures like an
-    // antivirus scan briefly holding the target executable's file handle should not
-    // disarm the launcher and force the user to wiggle the mouse. We only retry on
-    // genuinely transient errors (IO / unauthorized access) detected by the inner
-    // launch path returning failure. The retry budget is intentionally small to keep
-    // total tick latency bounded.
-    private bool TryLaunchWithTransientRetry(string trigger, out string failureMessage)
+    // Existence of the target, cached for TargetExistsCacheTtlMs.
+    //
+    // The uncached call sat on the UI thread on every 5s tick: 120,960 File.Exists calls per week.
+    // For a local path that is cheap, but the README advertises UNC targets, and File.Exists
+    // against an unreachable SMB host blocks for the connection timeout with the message pump
+    // held -- the tray menu stops opening and the app appears hung.
+    //
+    // The cache is keyed on the path, so choosing a different target invalidates it immediately
+    // rather than waiting out the TTL. A 30s staleness window is harmless here: the worst case is
+    // one tick that evaluates against a target which appeared or vanished moments ago, and the
+    // launch itself still fails safely if the file is gone.
+    private bool TargetExistsCached(string targetPath)
+    {
+        var nowMs = Environment.TickCount64;
+
+        if (_targetExistsCheckedAtMs != long.MinValue
+            && string.Equals(_targetExistsCachedPath, targetPath, StringComparison.OrdinalIgnoreCase)
+            && nowMs - _targetExistsCheckedAtMs < TargetExistsCacheTtlMs)
+        {
+            return _targetExistsCachedResult;
+        }
+
+        bool exists;
+        try
+        {
+            exists = File.Exists(targetPath);
+        }
+        catch (Exception ex)
+        {
+            // File.Exists swallows most errors, but a malformed or unreachable path can still
+            // throw. Treat it as missing rather than letting the tick die.
+            Logger.Warn($"Failed to probe target existence. Path='{targetPath}' Error='{ex.Message}'.");
+            exists = false;
+        }
+
+        _targetExistsCachedPath = targetPath;
+        _targetExistsCachedResult = exists;
+        _targetExistsCheckedAtMs = nowMs;
+        return exists;
+    }
+
+    // Retry wrapper for automatic idle-triggered launches. A transient failure -- an antivirus
+    // scanner briefly holding the target's file handle, say -- should not disarm the launcher and
+    // force the user to wiggle the mouse.
+    //
+    // NOTE the honest limitation: TryLaunchSelectedApp returns false for EVERY failure, including
+    // permanent ones (no target, unsupported type, file not found). This wrapper therefore retries
+    // those too and pays one extra UI-thread sleep for them. The earlier comment here claimed the
+    // retry fired "only on genuinely transient errors (IO / unauthorized access)"; no such
+    // classification existed then or now. Classifying the exception inside the launch path is
+    // recorded in BACKLOG.md.
+    //
+    // What IS now distinguished is the re-entrancy rejection, via alreadyInProgress -- see below.
+    private bool TryLaunchWithTransientRetry(string trigger, out string failureMessage, out bool alreadyInProgress)
     {
         for (var attempt = 0; ; attempt++)
         {
-            if (TryLaunchSelectedApp(trigger, launchedFromIdle: true, showErrorDialog: false, out failureMessage))
+            if (TryLaunchSelectedApp(trigger, launchedFromIdle: true, showErrorDialog: false, out failureMessage, out alreadyInProgress))
             {
                 return true;
+            }
+
+            // A launch is already running under a nested message pump (a modal dialog, or
+            // ShellExecuteEx pumping). Retrying cannot help and the caller must not treat it as a
+            // failure: doing so raised a false "Automatic launch failed" balloon and disarmed the
+            // launcher for a launch that was actually in flight and about to succeed.
+            if (alreadyInProgress)
+            {
+                return false;
             }
 
             if (attempt >= TransientLaunchRetryCount)
@@ -1033,13 +1155,15 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private bool TryLaunchSelectedApp(string trigger, bool launchedFromIdle, bool showErrorDialog, out string failureMessage)
+    private bool TryLaunchSelectedApp(string trigger, bool launchedFromIdle, bool showErrorDialog, out string failureMessage, out bool alreadyInProgress)
     {
         failureMessage = string.Empty;
+        alreadyInProgress = false;
 
         // Guard against concurrent launches (e.g., rapid Run Now clicks or overlapping idle triggers).
         if (Interlocked.Exchange(ref _launchingSerialized, 1) != 0)
         {
+            alreadyInProgress = true;
             failureMessage = "A launch is already in progress.";
             Logger.Warn($"Launch skipped ({trigger}) because another launch is already in progress.");
             return false;
@@ -1281,7 +1405,12 @@ internal sealed class TrayAppContext : ApplicationContext
         return value[..(maxLength - 1)] + "…";
     }
 
-    private bool UpdateTrackedProcessState(bool logStateChange)
+    // allowWorkstationLock exists because discovering an exit here has a SIDE EFFECT: it can
+    // lock the workstation. That is right from the timer tick, and wrong from a menu handler --
+    // enabling "Lock PC on App Close" used to lock the screen on the spot if the tracked
+    // idle-launched target happened to have exited since the last tick. A checkbox should not
+    // lock your machine.
+    private bool UpdateTrackedProcessState(bool logStateChange, bool allowWorkstationLock = true)
     {
         if (_runningProcess == null)
         {
@@ -1289,6 +1418,10 @@ internal sealed class TrayAppContext : ApplicationContext
             return false;
         }
 
+        // Captured EAGERLY, on purpose. This value is still used further down by
+        // MaybeLockWorkstationAfterTrackedProcessExit, which runs after _runningProcess.Dispose(),
+        // and reading a disposed Process's properties throws. Deferring this to a lazy closure
+        // would save two allocations per tick and buy an exception on the exit path.
         var processDescription = DescribeProcess(_runningProcess);
         var exited = false;
 
@@ -1301,14 +1434,31 @@ internal sealed class TrayAppContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            if (logStateChange)
+            // Treat as not exited and retry -- but NOT forever. Returning "still running"
+            // unconditionally meant one persistently throwing handle made OnTick return early on
+            // every tick for the life of the process: readiness never re-evaluated, the handle
+            // never disposed, and injected-input suppression latched ON system-wide, with nothing
+            // in the UI to show it. Give up after a few consecutive failures and fall through to
+            // the normal exit path so the app recovers.
+            _consecutiveProcessQueryFailures++;
+            if (_consecutiveProcessQueryFailures < MaxConsecutiveProcessQueryFailures)
             {
-                Logger.Warn($"Failed to query tracked process state. Process={processDescription} Error='{ex.Message}'.");
+                if (logStateChange)
+                {
+                    Logger.Warn(
+                        $"Failed to query tracked process state (attempt {_consecutiveProcessQueryFailures}/{MaxConsecutiveProcessQueryFailures}). Process={processDescription} Error='{ex.Message}'.");
+                }
+
+                return true;
             }
 
-            // Treat as not exited — we will retry on the next tick.
-            return true;
+            Logger.Error(
+                $"Giving up on the tracked process after {_consecutiveProcessQueryFailures} failed state queries; treating it as exited so the launcher can recover. Process={processDescription}.",
+                ex);
+            exited = true;
         }
+
+        _consecutiveProcessQueryFailures = 0;
 
         if (!exited)
         {
@@ -1339,7 +1489,10 @@ internal sealed class TrayAppContext : ApplicationContext
             // Ignore disposal failures on already-exited processes.
         }
 
-        MaybeLockWorkstationAfterTrackedProcessExit(processDescription);
+        if (allowWorkstationLock)
+        {
+            MaybeLockWorkstationAfterTrackedProcessExit(processDescription);
+        }
 
         _runningProcess = null;
         _trackedProcessWasIdleLaunch = false;
@@ -1520,6 +1673,30 @@ internal sealed class TrayAppContext : ApplicationContext
         return string.IsNullOrWhiteSpace(name)
             ? $"pid={pid}"
             : $"pid={pid} name='{name}'";
+    }
+
+    // Set once the tray icon exists, so the process-wide fatal handlers in Program.cs can clear
+    // it before Environment.Exit. Without this a crash in any menu handler leaves a ghost icon in
+    // the notification area until the user happens to hover over it.
+    private static TrayAppContext? _live;
+
+    // Best-effort, callable from a fatal exception handler on any thread. Deliberately does the
+    // minimum -- just hide the icon -- because the process is about to die and a full
+    // ShutdownForExit could itself throw from the very state that is already broken.
+    internal static void EmergencyHideTrayIcon()
+    {
+        try
+        {
+            var live = _live;
+            if (live?._notify is { } icon)
+            {
+                icon.Visible = false;
+            }
+        }
+        catch
+        {
+            // Nothing useful left to do; we are on the way out.
+        }
     }
 
     private void ShutdownForExit()

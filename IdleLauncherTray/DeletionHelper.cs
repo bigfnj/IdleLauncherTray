@@ -97,21 +97,32 @@ internal static class DeletionHelper
         // is written *after* the parent has exited, so it lands in the same
         // log file the user will inspect post-uninstall.
         var deleted = TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: 0);
+
+        // Deliberately NOT Logger. Logger.EnsureDirectoryExists calls Directory.CreateDirectory
+        // on AppPaths.BaseDir, and its _dirCreated cache is false in this fresh child process --
+        // so logging the successful delete RECREATED the very folder we had just removed and
+        // wrote a new log file into it. Uninstall therefore never left a clean state. Write the
+        // outcome outside the deleted tree instead, so it is still diagnosable.
+        LogCleanupOutcome(deleted
+            ? $"Deferred cleanup completed. Folder='{normalizedFolder}'."
+            : $"Deferred cleanup did not fully delete the folder after {MaxDeleteAttempts} attempts. Folder='{normalizedFolder}'.");
+    }
+
+    // Uninstall outcome goes to %TEMP%, never to AppPaths.BaseDir -- that folder is what we
+    // just deleted, and touching Logger would bring it back. Best effort: if this fails there is
+    // nowhere sensible left to report it.
+    private static void LogCleanupOutcome(string message)
+    {
         try
         {
-            if (deleted)
-            {
-                Logger.Info($"Deferred cleanup completed. Folder='{normalizedFolder}'.");
-            }
-            else
-            {
-                Logger.Warn($"Deferred cleanup did not fully delete the folder after {MaxDeleteAttempts} attempts. Folder='{normalizedFolder}'.");
-            }
+            var path = Path.Combine(Path.GetTempPath(), "IdleLauncherTray-uninstall.log");
+            File.AppendAllText(
+                path,
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}");
         }
         catch
         {
-            // Logging during cleanup is best-effort; the folder itself may be
-            // the log directory.
+            // Nothing left to do; the app is being uninstalled.
         }
     }
 
