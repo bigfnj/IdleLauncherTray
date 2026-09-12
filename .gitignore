@@ -3,6 +3,9 @@
 .ai-context/
 .copilot-instructions
 AI_UNDERSTANDING.md
+# ...and the sidecar DIRECTORY, not just the file. The .aiu.json sidecars were committed
+# once (5f9c9fd) and removed again (e1b134c) because only the .md was covered here.
+AI_UNDERSTANDING/
 ClientBriefing.md
 BACKLOG.md
 *.session.*
@@ -38,6 +41,11 @@ packages/
 # Build Artifacts
 publish/
 PublishProfiles/
+# Release workflow staging directory (release.yml builds the zip from here).
+stage/
+# `dotnet test` writes .trx and coverage here. Added with the first test project in v2.5.0 --
+# before that there was no test output to ignore, which is why it was missing.
+TestResults/
 
 # Logs
 *.log

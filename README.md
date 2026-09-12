@@ -205,7 +205,11 @@ dotnet publish IdleLauncherTray/IdleLauncherTray.csproj \
   -p:PublishTrimmed=false \
   -p:DebugType=embedded \
   -p:DebugSymbols=true \
-  -o publish/IdleLauncherTray-v2.4.0-win-x64-framework-dependent-singlefile
+  -o publish/IdleLauncherTray-win-x64-framework-dependent-singlefile
 ```
+
+The output folder name is deliberately version-free here. `tools/smoke-test.sh` derives the
+version from `<Version>` in the csproj and names its own output accordingly; hardcoding a
+version into this example is how it ended up two releases out of date.
 
 The resulting release is a portable framework-dependent Windows executable. Target machines must already have the .NET 10 desktop runtime installed.
