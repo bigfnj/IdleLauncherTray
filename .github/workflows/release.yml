@@ -84,3 +84,26 @@ jobs:
           files: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256
+
+      # Keep the Releases page to the three most recent builds, matching desktop-ai-companion and
+      # runas-helper. The git TAGS are retained (no --cleanup-tag), so any pruned release can be
+      # rebuilt from its tag -- deleting the tag would make this irreversible.
+      # Best-effort: a prune failure never fails a release that already published.
+      - name: Prune old releases (keep the 3 most recent; tags retained)
+        if: steps.version.outputs.is_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $keep = 3
+          try {
+            $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,createdAt |
+                        ConvertFrom-Json
+          } catch { Write-Host "prune: could not list releases: $_"; exit 0 }
+          $old = @($releases | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -Skip $keep)
+          foreach ($r in $old) {
+            Write-Host "Deleting old release $($r.tagName) (git tag kept)"
+            gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --yes
+          }
+          Write-Host "Kept the $keep most recent releases."
