@@ -4,13 +4,21 @@
 .copilot-instructions
 AI_UNDERSTANDING.md
 # ...and the sidecar DIRECTORY, not just the file. The .aiu.json sidecars were committed
-# once (5f9c9fd) and removed again (e1b134c) because only the .md was covered here.
+# once (fd48faf) and removed again (cd58ac8) because only the .md was covered here.
+# Those two SHAs are POST-rewrite. The 2026-09-12 filter-repo run renumbered every commit,
+# so the SHAs originally cited here (5f9c9fd / e1b134c) now 404 on GitHub and survive only
+# as dangling local objects. Re-verify with `git merge-base --is-ancestor <sha> HEAD` before
+# quoting any commit id in a comment.
 AI_UNDERSTANDING/
 ClientBriefing.md
 BACKLOG.md
 *.session.*
 SESSION_HANDOFF.md
 .agent-cache/
+.aider*
+.cursor/
+.github/copilot*
+.claude.json
 
 # Build Results
 bin/
@@ -54,6 +62,23 @@ TestResults/
 # Logs
 *.log
 logs/
+
+# Credentials and signing material
+# Nothing here has ever been committed -- this is a guard, not a cleanup. The realistic risk
+# on a PUBLIC repo is a code-signing cert dropped next to the csproj for a one-off signed
+# build, which is exactly the kind of file that gets swept up by a careless `git add -A`.
+# `*.user` in the Visual Studio block above already covers *.pubxml.user by accident; these
+# are deliberate. Verified with `git check-ignore -v` (each pattern matches, none shadows a
+# tracked file) before being committed.
+*.pfx
+*.p12
+*.snk
+*.pem
+*.key
+.env
+.env.*
+secrets.json
+appsettings.*.local.json
 
 # OS
 .DS_Store

@@ -15,7 +15,7 @@ namespace IdleLauncherTray;
 internal static class AppInfo
 {
     /// <summary>
-    /// The version to show a human: "2.7.0", not "2.7.0.0".
+    /// The version to show a human: "2.7.1", not "2.7.1.0".
     /// </summary>
     /// <remarks>
     /// Read from <see cref="AssemblyInformationalVersionAttribute"/> first, because that is what
@@ -32,7 +32,7 @@ internal static class AppInfo
     internal static string VersionDisplay { get; } = ResolveVersionDisplay();
 
     // NOTE: there is deliberately no combined "name v1.2.3" member here. The tooltip carries the
-    // version as a bare "v2.7.0" suffix and no app name at all, so a prebuilt display string would
+    // version as a bare "v2.7.1" suffix and no app name at all, so a prebuilt display string would
     // have had exactly zero callers.
 
     private static string ResolveVersionDisplay()

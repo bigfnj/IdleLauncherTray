@@ -2,6 +2,8 @@
 
 IdleLauncherTray is a **portable** Windows tray utility that waits for the machine to become genuinely idle and then launches a selected target.
 
+**Download:** grab the latest zip from [Releases](https://github.com/bigfnj/IdleLauncherTray/releases/latest). Each release ships a single-file win-x64 exe, the README and LICENSE, plus a `.sha256` sidecar so you can verify the download.
+
 It is a **Windows GUI exe (no console)** that:
 - Starts in the **system tray**
 - Tracks **physical keyboard/mouse idle time** and ignores injected automation input such as `SendKeys`
@@ -10,7 +12,7 @@ It is a **Windows GUI exe (no console)** that:
 - Launches a chosen **.exe**, **.scr**, **.bat**, **.cmd**, **.lnk**, **.msi**, **.ps1**, **.vbs**, **.jar**, or **.py** target once both conditions are met:
   - Input idle is greater than or equal to the configured number of minutes
   - Total CPU usage is less than or equal to the configured threshold (10% to 50%)
-- Stores settings in `%APPDATA%\IdleLauncherTray\config.json`
+- Stores settings in `%APPDATA%\IdleLauncherTray\config.json` (see [Relocating the data directory](#relocating-the-data-directory))
 - Writes logs to `%APPDATA%\IdleLauncherTray\IdleLauncherTray.log`
 - Supports optional **Run at startup** via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 
@@ -22,6 +24,18 @@ This project is intentionally **portable**:
 - If **Run at startup** is enabled, the registry entry points to the **current executable path**
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
+
+### Relocating the data directory
+
+By default the config, the log and any custom tray icon live in `%APPDATA%\IdleLauncherTray\`. Set the `IDLELAUNCHERTRAY_DATA_DIR` environment variable to an absolute path and the app uses that directory instead, which makes the app portable in the full sense: state can travel with the executable on a USB stick rather than staying behind in the roaming profile.
+
+Three things worth knowing before you use it:
+
+- A process inherits its environment at launch, so set the variable in the user or system environment (or in the shortcut/script that starts the app) **before** launching it. Setting it afterwards has no effect on an already-running instance.
+- A **relative** value is resolved against the current working directory rather than rejected, which is almost never what you want. Use a full path such as `E:\Tools\IdleLauncherTray-data`.
+- A **malformed** value falls back to `%APPDATA%` silently. If your settings are not where you expect, that is the first thing to check.
+
+When the variable is unset or blank the app behaves exactly as it always has. Uninstall deletes whichever directory is in effect, so point it somewhere the app owns rather than at a folder holding anything else.
 
 ## v2.7.1 highlights
 
