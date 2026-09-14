@@ -56,29 +56,79 @@ internal static class AppPaths
     public const string RunRegSubKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     public const string RunRegValueName = AppName;
 
+    /// <summary>
+    /// The default per-user data directory, composed so that it is ALWAYS fully qualified.
+    /// <para>
+    /// <see cref="Environment.SpecialFolderOption.DoNotVerify"/> is deliberate. The
+    /// documented behaviour of the plain overload is to return
+    /// <see cref="string.Empty"/> when the folder does not physically exist -- and we create
+    /// this directory ourselves (Logger.EnsureDirectoryExists, ConfigManager.Save), so we
+    /// want the PATH, not a verified folder. Asking for the path removes the empty-string
+    /// case entirely.
+    /// </para>
+    /// </summary>
     private static string DefaultBaseDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppName);
+        ComposeDefaultBaseDir(Environment.GetFolderPath(
+            Environment.SpecialFolder.ApplicationData,
+            Environment.SpecialFolderOption.DoNotVerify));
+
+    /// <summary>
+    /// Pure and total: for EVERY input it returns a fully-qualified path.
+    /// <para>
+    /// That invariant is not cosmetic. <c>Path.Combine("", "IdleLauncherTray")</c> is the bare
+    /// relative string <c>"IdleLauncherTray"</c>, and <c>DeletionHelper.IsSafeDeleteTarget</c>
+    /// authorises a recursive delete by comparing <c>Path.GetFullPath(BaseDir)</c> against a
+    /// caller path normalised the same way moments earlier. Both sides root against whatever
+    /// the current directory happens to be at that instant, they match, and the guard then
+    /// green-lights deleting <c>&lt;cwd&gt;\IdleLauncherTray</c> -- a folder that has nothing
+    /// to do with this app.
+    /// </para>
+    /// <para>
+    /// <see cref="Path.IsPathFullyQualified(string)"/>, NOT <c>Path.IsPathRooted</c>:
+    /// <c>IsPathRooted</c> answers true for the drive-relative <c>C:foo</c> and the
+    /// root-relative <c>\foo</c>, both of which still resolve against ambient process state.
+    /// </para>
+    /// <para>
+    /// And the fallback is <see cref="AppContext.BaseDirectory"/> rather than
+    /// <c>Path.GetFullPath(...)</c> on purpose. GetFullPath would root the broken value
+    /// against the current directory, which is exactly the "obviously wrong value becomes a
+    /// silently plausible one" failure described above. Beside the executable is somewhere a
+    /// human can find, and it is stable for the life of the process.
+    /// </para>
+    /// </summary>
+    private static string ComposeDefaultBaseDir(string? applicationDataPath)
+    {
+        if (string.IsNullOrWhiteSpace(applicationDataPath) || !Path.IsPathFullyQualified(applicationDataPath))
+        {
+            return Path.Combine(AppContext.BaseDirectory, AppName);
+        }
+
+        return Path.Combine(applicationDataPath, AppName);
+    }
 
     private static string ResolveBaseDir()
     {
         var configured = Environment.GetEnvironmentVariable(DataDirOverrideVariable);
-        if (string.IsNullOrWhiteSpace(configured))
+        if (!string.IsNullOrWhiteSpace(configured))
         {
-            return DefaultBaseDir;
+            try
+            {
+                // Rooting the override matters for more than tidiness: DeletionHelper compares
+                // a caller-supplied folder against this value to decide whether a recursive
+                // delete is allowed, and comparing a full path against a relative one would
+                // never match.
+                return Path.GetFullPath(configured.Trim());
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+            {
+                // A malformed override must not take the app down; fall through to the default.
+            }
         }
 
-        try
-        {
-            // Rooting the override matters for more than tidiness: DeletionHelper compares
-            // a caller-supplied folder against this value to decide whether a recursive
-            // delete is allowed, and comparing a full path against a relative one would
-            // never match.
-            return Path.GetFullPath(configured.Trim());
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
-        {
-            // A malformed override must not take the app down; fall back to the default.
-            return DefaultBaseDir;
-        }
+        // Reached from OUTSIDE the try/catch, deliberately. This is the last line of a method
+        // that must always produce a usable path, so the expression that produces it has to be
+        // total on its own -- not merely "total as long as we are still inside a catch block
+        // that would swallow its failure". ComposeDefaultBaseDir is that total function.
+        return DefaultBaseDir;
     }
 }

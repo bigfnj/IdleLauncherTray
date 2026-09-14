@@ -16,8 +16,21 @@ namespace IdleLauncherTray.Tests;
 /// </summary>
 public sealed class AppPathsTests
 {
+    /// <summary>
+    /// Must use the SAME overload the product uses. The plain
+    /// <c>GetFolderPath(ApplicationData)</c> returns <see cref="string.Empty"/> when the
+    /// folder does not physically exist; the product asks for
+    /// <see cref="Environment.SpecialFolderOption.DoNotVerify"/> because it creates the
+    /// directory itself. Calling the other overload here would make the three tests below
+    /// compare two different APIs, and they would pass or fail on whether the CI account
+    /// happens to have a materialised roaming profile rather than on the product's logic.
+    /// </summary>
     private static string RealUserDataDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppPaths.AppName);
+        Path.Combine(
+            Environment.GetFolderPath(
+                Environment.SpecialFolder.ApplicationData,
+                Environment.SpecialFolderOption.DoNotVerify),
+            AppPaths.AppName);
 
     [Fact]
     public void TestRun_RedirectsBaseDir_IntoTheTempRoot()
@@ -130,6 +143,87 @@ public sealed class AppPathsTests
             Assert.Equal(Path.Combine(root, "tray.ico"), AppPaths.TrayIconFile);
             Assert.Equal(Path.Combine(root, "IdleLauncherTray.exe"), AppPaths.LegacyInstalledExePath);
         }
+    }
+
+    /// <summary>
+    /// Every value the product could conceivably compose a default directory from: a real
+    /// path, the documented empty-string result, and the four shapes that look rooted enough
+    /// to fool a careless check.
+    /// </summary>
+    public static TheoryData<string?> EveryApplicationDataInput() => new()
+    {
+        null,
+        string.Empty,
+        "   ",
+        "\t",
+        "AppData",
+        "C:relative",
+        "\\rooted",
+        ".",
+        "C:\\Users\\someone\\AppData\\Roaming"
+    };
+
+    [Fact]
+    public void ComposeDefaultBaseDir_WithARealRoamingPath_CombinesTheAppNameOntoIt()
+    {
+        var roaming = Path.Combine(TestDataDirectory.Root, "roaming");
+
+        Assert.Equal(Path.Combine(roaming, AppPaths.AppName), AppPaths.ComposeDefaultBaseDir(roaming));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public void ComposeDefaultBaseDir_WithNothingUsable_FallsBackBesideTheExecutable(string? nothing)
+    {
+        // Environment.GetFolderPath is DOCUMENTED to return string.Empty when the folder does
+        // not physically exist, and Path.Combine("", "IdleLauncherTray") is the bare RELATIVE
+        // string "IdleLauncherTray". That is not a cosmetic defect: DeletionHelper authorises a
+        // recursive delete by rooting BaseDir against the current directory and comparing it to
+        // a caller path rooted the same way an instant earlier. They match, and the guard then
+        // says yes to deleting <cwd>\IdleLauncherTray.
+        Assert.Equal(Path.Combine(AppContext.BaseDirectory, AppPaths.AppName), AppPaths.ComposeDefaultBaseDir(nothing));
+    }
+
+    [Theory]
+    [InlineData("AppData")]
+    [InlineData(".")]
+    public void ComposeDefaultBaseDir_WithARelativePath_FallsBackBesideTheExecutable(string relative)
+    {
+        Assert.Equal(Path.Combine(AppContext.BaseDirectory, AppPaths.AppName), AppPaths.ComposeDefaultBaseDir(relative));
+    }
+
+    [Theory]
+    [InlineData("C:relative")]
+    [InlineData("\\rooted")]
+    public void ComposeDefaultBaseDir_WithAPathThatIsRootedButNotFullyQualified_StillFallsBack(string rootedButNot)
+    {
+        // The witness for Path.IsPathFullyQualified over Path.IsPathRooted. Both of these
+        // answer TRUE to IsPathRooted -- and both still resolve against ambient process state:
+        // "C:relative" against the current directory ON DRIVE C:, "\rooted" against the current
+        // drive. A check written with IsPathRooted waves them straight through, and this test
+        // is what fails if anyone swaps the two.
+        Assert.True(Path.IsPathRooted(rootedButNot), "Precondition: this input must look rooted.");
+        Assert.False(Path.IsPathFullyQualified(rootedButNot));
+
+        Assert.Equal(Path.Combine(AppContext.BaseDirectory, AppPaths.AppName), AppPaths.ComposeDefaultBaseDir(rootedButNot));
+    }
+
+    [Theory]
+    [MemberData(nameof(EveryApplicationDataInput))]
+    public void ComposeDefaultBaseDir_ForEveryInput_ReturnsAFullyQualifiedPath(string? applicationDataPath)
+    {
+        // The invariant the rest of the app rests on, asserted across the whole input domain
+        // rather than per case. DeletionHelper's safety guard compares normalised absolute
+        // paths; the moment BaseDir can be anything else, that comparison is against a value
+        // that means something different on every working directory.
+        var composed = AppPaths.ComposeDefaultBaseDir(applicationDataPath);
+
+        Assert.True(
+            Path.IsPathFullyQualified(composed),
+            $"ComposeDefaultBaseDir('{applicationDataPath ?? "<null>"}') returned '{composed}', which is not fully qualified.");
     }
 
     [Fact]
