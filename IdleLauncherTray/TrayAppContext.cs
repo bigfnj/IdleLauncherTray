@@ -312,7 +312,11 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (dlg.ShowDialog() == DialogResult.OK)
             {
-                var selectedPath = TargetFilePolicy.NormalizePath(dlg.FileName);
+                // PrepareForStorage, because this value is about to be WRITTEN to config.json.
+                // A file dialog cannot hand back a "%VAR%" path, so the two calls agree here
+                // today; naming the storage form anyway is what stops the next person restoring
+                // the expand-then-persist behaviour that baked a portable config to one machine.
+                var selectedPath = TargetFilePolicy.PrepareForStorage(dlg.FileName);
                 if (!TargetFilePolicy.IsSupportedTarget(selectedPath))
                 {
                     Logger.Warn($"Application selection rejected because the file type is unsupported. Path='{selectedPath}'.");
@@ -626,9 +630,16 @@ internal sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
-            if (!File.Exists(_cfg.AppPath))
+            // ResolveForUse, not the stored value. The config now keeps the path exactly as the
+            // user wrote it, environment variables and all, so File.Exists against the raw string
+            // would report a perfectly good "%APPDATA%\tools\app.exe" as missing and refuse to run
+            // it. The message still shows the stored spelling, because that is the one the user
+            // typed and the one they would go and fix.
+            var runNowPath = TargetFilePolicy.ResolveForUse(_cfg.AppPath);
+            if (!File.Exists(runNowPath))
             {
-                Logger.Warn($"Run Now aborted because the selected file does not exist. Path='{_cfg.AppPath}'.");
+                Logger.Warn(
+                    $"Run Now aborted because the selected file does not exist. Stored='{_cfg.AppPath}' Resolved='{runNowPath}'.");
 
                 MessageBox.Show(
                     $"Selected file not found:\n{_cfg.AppPath}",
