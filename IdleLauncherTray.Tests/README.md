@@ -16,6 +16,7 @@ dotnet test IdleLauncherTray.sln -c Release
 | `ConfigManager` | defaults, full save/load round trip, every normalisation clamp, comment/trailing-comma tolerance, and that a corrupt, empty, wrong-shaped or unreadable file yields defaults rather than an exception |
 | `CpuUsageMonitor` | the FILETIME halves combining without sign extension, the first-sample priming, the divide-by-zero guard when two samples land in one clock tick, the counter-regression re-baseline for each of the three counters independently, and the idle-exceeds-total clamp |
 | `AppPaths` | the `IDLELAUNCHERTRAY_DATA_DIR` override, the fall-back to `%APPDATA%`, and the canary described below |
+| `PhysicalIdle` hook liveness | the rule that decides a hook was silently dropped — that an idle user is never reported as one at any tick count, that an unusable `GetLastInputInfo` reading is not evidence, the grace and tick thresholds, that both callbacks move the heartbeat even when told to pass the event straight through, the reason strings fitting the tray tooltip, and that an external-activity report advances the idle clock without ever moving it backwards |
 
 ## What is NOT covered
 
@@ -24,8 +25,11 @@ This suite protects the pure functions. It does not protect the app.
 - **`TrayAppContext`** — the whole tray lifecycle: the context menu, the idle poll timer,
   launching the target process, the launch cooldown, workstation lock on close, the
   uninstall flow. It needs a window and a message pump.
-- **`PhysicalIdle`** — the low-level keyboard/mouse hooks, `GetLastInputInfo`, XInput
-  gamepad polling and the injected-input filter. It needs real input and a message pump.
+- **`PhysicalIdle`'s hooks themselves** — installing them, the injected-input filter, XInput
+  gamepad polling, and the 5 s tick that drives the drop detector. Those need real input, a
+  message pump and a global hook this suite must not install. What *is* covered is the
+  decision the tick makes: `IsHookDropSuspected` is a pure function of two clock readings
+  and a tick count, so every case is reachable as an argument.
 - **`StartupManager`** — writes to `HKCU\...\Run`. Testable in principle, untested here
   because it mutates real machine state.
 - **`Logger`** — only its path is asserted, not rotation or its locking.
@@ -114,6 +118,19 @@ behaviour is already determined by something else:
   rootless path still fails the must-equal-BaseDir test. Removing *both* plus the equality
   test is killed by 30 tests. Three overlapping guards on a recursive delete is the right
   amount; this records which ones are load-bearing alone.
+
+The hook-liveness tests were added the same way: 9 mutations, each breaking one decision the
+new tests claim to guard, applied one at a time with the product DLL's timestamp checked so
+a green run could not come from a stale build. All 9 were killed by the test that names the
+behaviour — including the two that matter most, the naive "the hook has not fired lately"
+detector (killed by the idle-machine theory) and a `GetIdleMilliseconds` that keeps trusting
+a hook it suspects is dead.
+
+One half-mutation is over-determined and worth recording: deleting the `double.IsInfinity`
+guard from the evidence rule is killed for a negative or `NegativeInfinity` reading but not
+for `PositiveInfinity`, because `callbackAge - PositiveInfinity` is already negative and no
+gap can exceed the grace. The guard stays, for the two cases that do need it and because the
+intent should not depend on that arithmetic.
 
 The one test method no mutation kills is
 `AppPathsTests.TestRun_NeverPointsBaseDir_AtTheRealUserDataDirectory`. The only mutation
