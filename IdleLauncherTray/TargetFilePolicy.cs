@@ -159,6 +159,24 @@ internal static class TargetFilePolicy
             return TargetPathStatus.Unparseable;
         }
 
+        // An UNRESOLVED environment variable is Unparseable, not UnsupportedType.
+        //
+        // ExpandEnvironmentVariables leaves "%NAME%" untouched when NAME is not defined, so
+        // "C:\tools\%ILT_TOOLS%" arrives here with no extension at all and would otherwise be
+        // judged an unsupported TYPE and have the user's target CLEARED -- permanently, because
+        // NormalizeInPlace also runs on Save.
+        //
+        // Since v2.7 the stored path deliberately keeps its variables, which makes "does this have
+        // a supported extension" a property of THIS MACHINE'S ENVIRONMENT rather than of the string.
+        // That is exactly the reason Unparseable is kept rather than cleared: a target that cannot
+        // be resolved here may be perfectly valid on the box the config came from, or on this one
+        // after the logon script that defines the variable has run. Reachable in one launch: a Run
+        // key entry racing a login script.
+        if (ContainsUnresolvedVariable(fullPath))
+        {
+            return TargetPathStatus.Unparseable;
+        }
+
         // Decided on the full path rather than on the raw string so that "app.exe\" and
         // "app.exe/../notes.txt" are judged as what they actually resolve to.
         var extension = Path.GetExtension(fullPath);
@@ -170,6 +188,36 @@ internal static class TargetFilePolicy
 
     public static bool IsSupportedTarget(string? path) =>
         ClassifyTarget(path) == TargetPathStatus.Supported;
+
+    /// <summary>
+    /// Whether a percent-delimited token survived expansion, i.e. names a variable this machine
+    /// does not define.
+    /// </summary>
+    /// <remarks>
+    /// Requires a PAIR of percent signs with something between them, because a lone '%' is legal in
+    /// a Windows file name and "100%.exe" must stay a supported target. Windows itself treats an
+    /// unmatched '%' as a literal, so matching that rule is what keeps this from clearing a file
+    /// the user can actually launch.
+    /// </remarks>
+    internal static bool ContainsUnresolvedVariable(string? path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return false;
+        }
+
+        var open = path.IndexOf('%');
+        if (open < 0)
+        {
+            return false;
+        }
+
+        var close = path.IndexOf('%', open + 1);
+
+        // close > open + 1 rather than >= : "%%" is an empty name, which expansion leaves alone and
+        // which names no variable, so it is not evidence of an unresolved one.
+        return close > open + 1;
+    }
 
     /// <summary>
     /// A path capped to a length a MessageBox and a log line can both carry, with the number of

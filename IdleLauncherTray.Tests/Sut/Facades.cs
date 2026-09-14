@@ -64,6 +64,9 @@ internal static class TargetFilePolicy
 
     internal static string GetUnsupportedTargetMessage(string? path) =>
         (string)Product.CallStatic(TypeName, nameof(GetUnsupportedTargetMessage), path)!;
+
+    internal static bool ContainsUnresolvedVariable(string? path) =>
+        (bool)Product.CallStatic(TypeName, nameof(ContainsUnresolvedVariable), path)!;
 }
 
 /// <summary>

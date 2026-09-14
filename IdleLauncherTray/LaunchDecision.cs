@@ -41,9 +41,14 @@ internal readonly record struct LaunchInputs
 /// <see cref="RebaselinedLastLaunchUtc"/> is how the clock-warp repair escapes a pure function.
 /// The old code wrote <c>_lastLaunchUtc</c> in the middle of the evaluation and logged from there;
 /// a pure function can do neither, so it reports the corrected value and the size of the jump and
-/// lets the caller persist and log. That is not merely a purity concession -- the repaired value is
-/// written to config.json and survives restart, so making it an explicit output rather than a
-/// hidden side effect is the honest shape.
+/// lets the caller persist and log.
+/// <para>
+/// The caller MUST write the repaired value through to <c>config.json</c>, not merely to its
+/// in-memory copy. The bad timestamp is persisted, so repairing only RAM leaves the next start to
+/// parse the same future value back in and strand the cooldown all over again. That is the whole
+/// failure this repair exists to end, and it is why the corrected value is an explicit output
+/// rather than a hidden side effect.
+/// </para>
 /// </remarks>
 internal readonly record struct LaunchDecisionResult
 {

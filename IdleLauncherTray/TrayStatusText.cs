@@ -38,9 +38,15 @@ internal static class TrayStatusText
     private const string Separator = ": ";
     private const string FallbackPrefix = AppPaths.AppName;
 
-    // The prefix is data (the app name), so it gets a budget of its own; without one, a long
-    // name could eat the entire line and leave no room for the status that is the point of it.
-    private const int MaxPrefixLength = 24;
+    // The prefix is data (the app name and version), so it gets a budget of its own; without one,
+    // a long name could eat the entire line and leave no room for the status that is the point
+    // of it.
+    //
+    // 28 rather than 24 because the prefix now carries the version: "IdleLauncherTray v2.7.0" is
+    // 23, and a two-digit minor or patch ("v2.10.11") reaches 25. At 24 the version would have
+    // started silently truncating at the next release but one, which is exactly the kind of thing
+    // nobody notices until the tooltip reads "v2.10.1" for a 2.10.11 build.
+    private const int MaxPrefixLength = 28;
 
     private const string DegradedPrefix = "DEGRADED - ";
     private const string RunningPrefix = "Running ";

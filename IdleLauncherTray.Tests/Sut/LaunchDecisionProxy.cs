@@ -85,6 +85,18 @@ internal static class TickCpuSampling
         (int)Product.CallStatic(TypeName, nameof(NextConsecutiveInvalidCpuSamples), current, sampleValid, maxSamples)!;
 }
 
+/// <summary>Mirror of the product's <c>IdleLauncherTray.AppInfo</c>.</summary>
+internal static class AppInfo
+{
+    private const string TypeName = "AppInfo";
+
+    internal static string VersionDisplay =>
+        Product.ReadStaticProperty<string>(TypeName, nameof(VersionDisplay));
+
+    internal static string TrayDisplayName =>
+        Product.ReadStaticProperty<string>(TypeName, nameof(TrayDisplayName));
+}
+
 /// <summary>
 /// Mirror of the degraded-state balloon's per-reason rate limit on <c>TrayAppContext</c>.
 /// </summary>

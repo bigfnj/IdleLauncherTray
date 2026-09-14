@@ -112,7 +112,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
     // Last text successfully applied to NotifyIcon.Text, seeded with the value the NotifyIcon is
     // constructed with so the first genuine status change is the first syscall.
-    private string _lastTrayStatusText = AppPaths.AppName;
+    private string _lastTrayStatusText = AppInfo.TrayDisplayName;
     private bool _trayStatusFailureLogged;
 
     // Degradation notification state. The reason STRING is remembered rather than a bool: see
@@ -178,7 +178,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         _notify = new NotifyIcon
         {
-            Text = AppPaths.AppName,
+            Text = AppInfo.TrayDisplayName,
             Visible = true
         };
 
@@ -409,7 +409,13 @@ internal sealed class TrayAppContext : ApplicationContext
             _cfg.BlockInjectedWhileRunning = _miBlockInjected.Checked;
             ConfigManager.Save(_cfg);
             SetInjectedSuppression(
-                _cfg.BlockInjectedWhileRunning && UpdateTrackedProcessState(logStateChange: false),
+                // allowWorkstationLock: false, for the same reason the Lock-PC checkbox passes it.
+                // UpdateTrackedProcessState locks the workstation when it DISCOVERS a tracked exit,
+                // so without this, ticking this box within the five seconds before the tick reaps
+                // an idle-launched target that has just closed locks the machine from inside a
+                // checkbox handler. A checkbox should not lock your PC.
+                _cfg.BlockInjectedWhileRunning
+                    && UpdateTrackedProcessState(logStateChange: false, allowWorkstationLock: false),
                 _cfg.BlockInjectedWhileRunning
                     ? "blocking while running was enabled"
                     : "blocking while running was disabled");
@@ -658,7 +664,28 @@ internal sealed class TrayAppContext : ApplicationContext
             // Nothing is lost by leaving it armed. A second launch on the same tick is already
             // blocked by the tracked-process handle and by the 10s cooldown, and the automatic
             // path keeps its own disarm so a failing target still cannot loop.
-            TryLaunchSelectedApp("manual Run Now", launchedFromIdle: false, showErrorDialog: true, out _, out _, out _);
+            if (!TryLaunchSelectedApp(
+                    "manual Run Now",
+                    launchedFromIdle: false,
+                    showErrorDialog: true,
+                    out _,
+                    out var alreadyInProgress,
+                    out _)
+                && alreadyInProgress)
+            {
+                // The one failure path that does NOT honour showErrorDialog: it returns before
+                // every MessageBox in the launch method. Without this, clicking Run Now while an
+                // automatic launch is still inside ShellExecuteEx -- which pumps messages, so the
+                // menu still opens and still dispatches this click -- did nothing at all. No
+                // launch, no dialog, no tooltip change, one Warn in a log nobody is reading. A
+                // menu item that silently does nothing is this app's oldest failure shape with a
+                // mouse attached.
+                MessageBox.Show(
+                    "A launch is already in progress. Wait for it to finish and try again.",
+                    AppPaths.AppName,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
         });
 
         _menu.Items.Add(miRunNow);
@@ -1172,7 +1199,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 var runningDegradation = ComposeDegradationReason();
                 UpdateDegradationNotification(runningDegradation);
                 SetTrayStatusText(TrayStatusText.ForRunningTarget(
-                    AppPaths.AppName,
+                    AppInfo.TrayDisplayName,
                     runningDegradation,
                     TargetFileNameOrNull(TargetFilePolicy.NormalizePath(_cfg.AppPath))));
 
@@ -1242,7 +1269,7 @@ internal sealed class TrayAppContext : ApplicationContext
             var degradation = ComposeDegradationReason();
             UpdateDegradationNotification(degradation);
             SetTrayStatusText(TrayStatusText.ForEvaluation(
-                AppPaths.AppName,
+                AppInfo.TrayDisplayName,
                 degradation,
                 evaluation.ReasonCode,
                 _armed,
@@ -1273,7 +1300,7 @@ internal sealed class TrayAppContext : ApplicationContext
             // unhandled UI-thread exception and takes the process down via Program.cs.
             try
             {
-                SetTrayStatusText(TrayStatusText.ForTickFailure(AppPaths.AppName));
+                SetTrayStatusText(TrayStatusText.ForTickFailure(AppInfo.TrayDisplayName));
             }
             catch
             {
@@ -1487,23 +1514,39 @@ internal sealed class TrayAppContext : ApplicationContext
         var targetSupported = hasTarget && TargetFilePolicy.IsSupportedTarget(targetPath);
         var targetExists = targetSupported && TargetExistsCached(targetPath);
 
+        // THE SESSION FLAG IS READ BEFORE THE IDLE CLOCK, AND THE ORDER IS LOAD-BEARING.
+        //
+        // OnSessionSwitch resets the idle clock and THEN clears _workstationLocked, so that a tick
+        // can never see "unlocked" alongside an idle measurement taken during the lock. That
+        // writer order only protects a reader that reads the FLAG first and the CLOCK second.
+        //
+        // Read the other way round -- which is what an object initializer does, since C# evaluates
+        // its members in source order -- the guarantee inverts: the tick samples nine hours of
+        // lock-screen idle, is preempted, the SystemEvents thread runs the entire unlock handler,
+        // and the tick resumes to read `false`. The result is InputIdleOk AND SessionOk together,
+        // Ready is true, and the target launches onto the desktop the user just signed back into.
+        // The log line would be perfectly self-consistent and describe a state the machine was
+        // never in.
+        //
+        // Both are read into locals here so the order is explicit and cannot be changed by
+        // reordering the initializer below. One read each: reading _workstationLocked twice would
+        // let a transition land between the two and produce "locked" in the log with "session ok"
+        // in the decision, or the reverse.
+        var workstationLocked = _workstationLocked;
+        var idleSeconds = GetIdleSeconds();
+
         var result = LaunchDecision.Evaluate(new LaunchInputs
         {
             TargetPath = targetPath,
             HasTarget = hasTarget,
             TargetSupported = targetSupported,
             TargetExists = targetExists,
-            IdleSeconds = GetIdleSeconds(),
+            IdleSeconds = idleSeconds,
             RequiredIdleSeconds = _cfg.IdleMinutes * 60,
             CpuSampleValid = cpuSampleValid,
             CpuPercent = cpuPercent,
             CpuThresholdPercent = _cfg.CpuThresholdPercent,
-
-            // ONE volatile read. Reading _workstationLocked twice would let a lock or unlock land
-            // between the two reads and produce an evaluation that describes no state the machine
-            // was ever in -- "locked" in the log line and "session ok" in the decision, or the
-            // reverse.
-            WorkstationLocked = _workstationLocked,
+            WorkstationLocked = workstationLocked,
             AllowLaunchWhileLocked = _cfg.AllowLaunchWhileLocked,
             LastLaunchUtc = _lastLaunchUtc,
             NowUtc = DateTime.UtcNow,
@@ -1516,6 +1559,18 @@ internal sealed class TrayAppContext : ApplicationContext
         // side effect worth keeping visible rather than burying inside the evaluation.
         if (result.RebaselinedLastLaunchUtc.HasValue)
         {
+            // PERSIST the repair, not just the in-memory copy.
+            //
+            // Repairing only _lastLaunchUtc left config.json holding the future timestamp, so the
+            // constructor parsed it back in on the next start and the cooldown was re-stranded on
+            // every single launch of the app until some later successful launch happened to
+            // overwrite it. That is the same "survived restart with nothing to show why" failure
+            // the repair exists to end, reduced in magnitude rather than removed -- and until now
+            // the comment on LaunchDecision.RebaselinedLastLaunchUtc claimed this write already
+            // happened.
+            _cfg.LastLaunchUtc = result.RebaselinedLastLaunchUtc.Value.ToString("o", CultureInfo.InvariantCulture);
+            ConfigManager.Save(_cfg);
+
             Logger.Warn(
                 $"Launch cooldown timestamp is in the future by {result.ClockWarpSeconds:F0}s (clock change or edited config). Re-baselining to now.");
             _lastLaunchUtc = result.RebaselinedLastLaunchUtc;

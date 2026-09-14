@@ -1,0 +1,78 @@
+using System;
+using System.Reflection;
+
+namespace IdleLauncherTray;
+
+/// <summary>
+/// What this build calls itself, and where it keeps its things.
+/// </summary>
+/// <remarks>
+/// Separate from <see cref="AppPaths"/> on purpose: that type answers "where does a file live",
+/// which the whole app depends on, while this one exists for the About dialog and the tray's
+/// version header. Keeping the version read out of AppPaths avoids putting assembly reflection on
+/// a path that <c>DeletionHelper</c> consults to authorise a recursive delete.
+/// </remarks>
+internal static class AppInfo
+{
+    /// <summary>
+    /// The version to show a human: "2.7.0", not "2.7.0.0".
+    /// </summary>
+    /// <remarks>
+    /// Read from <see cref="AssemblyInformationalVersionAttribute"/> first, because that is what
+    /// the csproj's &lt;Version&gt; produces and what the release workflow overwrites from the git
+    /// tag, so it is the value that always matches the tag a user downloaded. It can carry a
+    /// "+&lt;commit&gt;" suffix from SourceLink-style builds, which is noise in a menu, so the
+    /// suffix is trimmed.
+    /// <para>
+    /// Falls back to the four-part assembly version. Deliberately NOT
+    /// <c>FileVersionInfo.GetVersionInfo(Assembly.Location)</c>: this ships as a single-file
+    /// publish, where <c>Assembly.Location</c> is an empty string and that call throws.
+    /// </para>
+    /// </remarks>
+    internal static string VersionDisplay { get; } = ResolveVersionDisplay();
+
+    /// <summary>
+    /// What the tray icon calls itself: "IdleLauncherTray v2.7.0".
+    /// </summary>
+    /// <remarks>
+    /// A tray-only app has nowhere else to say which build is running. The version is in the exe's
+    /// file properties and in the first line of every log, but neither is reachable from the tray,
+    /// which is the only surface this app has.
+    /// <para>
+    /// Built once here rather than at each of the three tooltip call sites, so the two cannot
+    /// drift and the 63-character budget is spent against one known prefix.
+    /// </para>
+    /// </remarks>
+    internal static string TrayDisplayName { get; } = $"{AppPaths.AppName} v{VersionDisplay}";
+
+    private static string ResolveVersionDisplay()
+    {
+        try
+        {
+            var assembly = typeof(AppInfo).Assembly;
+
+            var informational = assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion;
+
+            if (!string.IsNullOrWhiteSpace(informational))
+            {
+                var plus = informational.IndexOf('+');
+                return plus > 0 ? informational[..plus] : informational;
+            }
+
+            var version = assembly.GetName().Version;
+            if (version != null)
+            {
+                return version.ToString(3);
+            }
+        }
+        catch
+        {
+            // Never let a cosmetic version lookup take down startup: this runs while the tray menu
+            // is being built, and the constructor's failure path tears the whole app down.
+        }
+
+        return "unknown";
+    }
+}

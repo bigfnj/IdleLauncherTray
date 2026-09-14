@@ -81,14 +81,20 @@ internal static class StartupManager
     /// Reports whether Windows will start this app at logon.
     /// </summary>
     /// <remarks>
-    /// The question this answers is "will the app start", and the only fact Windows acts on is
-    /// that a value exists under our value name. So that is what is reported. The canonical
-    /// comparison below is only our guess at whether a value is <i>ours</i>, and
+    /// The question this answers is "will the app start at logon", which is neither "does a value
+    /// exist" nor "does that value match our path".
+    /// <para>
     /// <see cref="TryGetCanonicalExePath"/> cannot see through 8.3 short names, junctions or
-    /// symlinks — a Run entry written through any of those failed the comparison, and the tray
-    /// then showed "Run at startup" unchecked while the app really did launch at every logon. A
-    /// user who wanted it off saw it already off and did nothing. A wrong guess about whose value
-    /// it is must not turn into a wrong statement about whether the app starts.
+    /// symlinks, so requiring an exact match showed "Run at startup" unchecked while the app really
+    /// did launch at every logon, and the user who wanted it off saw it already off and did
+    /// nothing. But treating mere existence as enabled is the mirror failure: move the portable exe
+    /// and the stale entry starts nothing while the menu insists it is on, with no way to repair it
+    /// from the UI.
+    /// </para>
+    /// <para>
+    /// So a value that does not match is judged by whether its target still EXISTS. That keeps the
+    /// short-name and junction cases working and reports the stale-path case honestly.
+    /// </para>
     /// </remarks>
     public static bool GetStartupEnabled()
     {
@@ -132,16 +138,29 @@ internal static class StartupManager
                 return true;
             }
 
-            // A value exists under our value name and canonicalises to neither path we know. Still
-            // ENABLED: Windows runs whatever is there, so that is what the tray must show.
+            // A value exists under our value name and canonicalises to neither path we know. What
+            // matters is whether the stored command can actually START something, because that is
+            // the question the checkbox is asking.
             //
-            // The mismatch remains worth knowing, because there are two very different stories
-            // behind it -- a path we simply cannot canonicalise (a short name, a junction, a
-            // symlink), or a different copy of this app that has claimed the same value name. Both
-            // paths go in the log, every time, so the one that matters is reconstructible.
+            // Reporting ENABLED purely because a value EXISTS was wrong in one direction: move the
+            // portable exe to another folder and the stale entry launches nothing, while the tray
+            // insists startup is on -- a state entered, never left, never reported, and with the
+            // menu actively discouraging the one action (untick, re-tick) that repairs it.
+            //
+            // Reporting DISABLED purely because the path does not match was wrong in the other
+            // direction: a Run value written through an 8.3 short name, a junction or a symlink
+            // does not canonicalise to ours, yet it starts the app at every logon.
+            //
+            // Existence of the TARGET separates the two. A path we cannot canonicalise still
+            // resolves to a real file, so it reports enabled; a stale path pointing at a file that
+            // is gone reports disabled, which is both true and repairable from the menu.
+            var storedTarget = TryGetCanonicalExePath(val);
+            var storedTargetExists = storedTarget != null && File.Exists(storedTarget);
+
             Logger.Warn(
-                $"Startup registry value exists but does not canonicalise to the current executable. Reporting startup as ENABLED anyway, because Windows will run the stored command at logon regardless. Stored='{val}' Current='{CurrentStartupCommand()}'.");
-            return true;
+                $"Startup registry value exists but does not canonicalise to the current executable. Reporting startup as {(storedTargetExists ? "ENABLED" : "DISABLED")}, because the stored command {(storedTargetExists ? "names a file that exists, so Windows will run it at logon" : "names a file that is missing, so Windows will start nothing -- re-tick Run at startup to repair it")}. Stored='{val}' Current='{CurrentStartupCommand()}'.");
+
+            return storedTargetExists;
         }
         catch (Exception ex)
         {
