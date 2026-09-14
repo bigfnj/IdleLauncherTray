@@ -1135,8 +1135,24 @@ internal sealed class TrayAppContext : ApplicationContext
             // a sampler that died during a long run stayed invisible until the target exited, and
             // one that recovered during a run kept reporting stuck.
             var cpuSampleValid = _cpu.TryNextValue(out var cpuPercent);
+            var previousInvalidCpuSamples = _consecutiveInvalidCpuSamples;
             _consecutiveInvalidCpuSamples = NextConsecutiveInvalidCpuSamples(
                 _consecutiveInvalidCpuSamples, cpuSampleValid, MaxConsecutiveInvalidCpuSamples);
+
+            // Say WHY, exactly once per episode of failures.
+            //
+            // The tooltip reports THAT sampling is stuck; only this can report the Win32 error
+            // behind it, and a stuck sampler means the app never launches its target at all. The
+            // counter saturates at the cap, so this pair of conditions is true only on the tick
+            // that crosses it -- which is what keeps a permanently broken sampler from writing
+            // twelve identical lines a minute forever, and is why CpuUsageMonitor records the
+            // error instead of logging it from inside the sampler.
+            if (_consecutiveInvalidCpuSamples == MaxConsecutiveInvalidCpuSamples
+                && previousInvalidCpuSamples < MaxConsecutiveInvalidCpuSamples)
+            {
+                Logger.Warn(
+                    $"CPU sampling has produced {MaxConsecutiveInvalidCpuSamples} unusable samples in a row ({MaxConsecutiveInvalidCpuSamples * CheckIntervalSeconds}s). {_cpu.DescribeLastSampleFailure()}");
+            }
 
             PhysicalIdle.TryRepairHooksIfNeeded();
 
