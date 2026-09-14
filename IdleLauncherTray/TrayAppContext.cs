@@ -118,7 +118,17 @@ internal sealed class TrayAppContext : ApplicationContext
     // Degradation notification state. The reason STRING is remembered rather than a bool: see
     // UpdateDegradationNotification.
     private string? _lastDegradationReason;
-    private long _lastDegradationBalloonMs = long.MinValue;
+    // When each DISTINCT reason was last ballooned. Deliberately not cleared on recovery: an
+    // A -> clear -> A cycle every six seconds would otherwise balloon every six seconds, which is
+    // the flap this interval exists to stop wearing a different hat. A reason that returns after
+    // its own window has expired balloons again, which is what anyone would expect.
+    //
+    // Bounded by construction -- ComposeDegradationReason can only return one of a handful of
+    // compile-time literals -- but the cap is defence in depth against a future caller that
+    // interpolates a reason. This process runs for months, and an unbounded dictionary keyed on a
+    // string is how that becomes a leak.
+    private readonly Dictionary<string, long> _degradationNotifiedAtMs = new(StringComparer.Ordinal);
+    private const int MaxTrackedDegradationReasons = 8;
     private const int DegradationBalloonMinIntervalMs = 5 * 60 * 1000;
 
     // Consecutive unusable CPU samples. A stuck sampler is invisible otherwise: CpuOk is simply
@@ -127,85 +137,10 @@ internal sealed class TrayAppContext : ApplicationContext
     private int _consecutiveInvalidCpuSamples;
     private const int MaxConsecutiveInvalidCpuSamples = 12;
 
-    // Mutable record (init-style construction via object initializer, then field
-    // updates as the evaluation progresses). Record gives us auto-equality and
-    // ToString() for free; we keep the explicit Describe() for human-readable logs.
-    private sealed record LaunchEvaluation
-    {
-        public string TargetPath { get; set; } = string.Empty;
-        public bool HasTarget { get; set; }
-        public bool TargetSupported { get; set; }
-        public bool TargetExists { get; set; }
-        public bool CooldownOk { get; set; } = true;
-        public double CooldownRemainingSeconds { get; set; }
-        public int IdleSeconds { get; set; }
-        public int RequiredIdleSeconds { get; set; }
-        public bool InputIdleOk { get; set; }
+    // Re-entrancy latch for the tick. See OnTick: Process.Start pumps messages, so a WM_TIMER can
+    // re-enter the tick while the outer call is still inside the launch path.
+    private int _tickInProgress;
 
-        // Whether idle was actually SAMPLED this evaluation. The early-return paths (no target,
-        // unsupported, missing) leave InputIdleOk at its initialiser `false`, which is
-        // indistinguishable from a measured "the user is active" -- and the re-arm logic treated
-        // it as exactly that, re-arming with no measurement and then logging that fresh user
-        // activity had been observed. Never infer activity from InputIdleOk alone.
-        public bool IdleMeasured { get; set; }
-        public double CpuPercent { get; set; }
-        public bool CpuSampleValid { get; set; }
-        public int CpuThresholdPercent { get; set; }
-        public bool CpuOk { get; set; }
-
-        // Whether the workstation was locked at the moment this evaluation was taken.
-        public bool WorkstationLocked { get; set; }
-
-        // Whether the session state permits launching. Separate from WorkstationLocked because
-        // the user can opt into launching anyway (AppConfig.AllowLaunchWhileLocked), so "locked"
-        // and "blocked" are genuinely different facts and the log has to be able to say which.
-        public bool SessionOk { get; set; } = true;
-
-        public LaunchReasonCode ReasonCode { get; set; } = LaunchReasonCode.Unknown;
-
-        // Ready is computed from the booleans and ignores ReasonCode entirely, which is why
-        // SessionOk has to appear HERE and not only in the labelling cascade below. Adding the
-        // reason code without adding the boolean would have produced an evaluation that says
-        // "WorkstationLocked" and launches anyway.
-        public bool Ready =>
-            HasTarget && TargetSupported && TargetExists && SessionOk && CooldownOk && InputIdleOk && CpuOk;
-
-        public string StateKey(bool armed)
-        {
-            // NOTE: ReasonCode is an enum, so this binds string.Join(string, params object?[])
-            // rather than the params string?[] overload it used to. The rendered output is
-            // identical because Enum.ToString() yields the member name, which is byte-identical
-            // to the string literal it replaced -- and a test pins the exact string so the next
-            // person to touch this does not have to take that on trust.
-            return string.Join(
-                "|",
-                armed ? "armed" : "disarmed",
-                ReasonCode,
-                HasTarget ? "target" : "no-target",
-                TargetSupported ? "target-supported" : "target-unsupported",
-                TargetExists ? "target-exists" : "target-missing",
-                WorkstationLocked ? "locked" : "unlocked",
-                SessionOk ? "session-ok" : "session-blocked",
-                CooldownOk ? "cooldown-ok" : "cooldown-wait",
-                InputIdleOk ? "idle-ok" : "idle-wait",
-                CpuSampleValid ? "cpu-valid" : "cpu-invalid",
-                CpuOk ? "cpu-ok" : "cpu-blocked");
-        }
-
-        public string Describe(bool armed)
-        {
-            var state = Ready
-                ? (armed ? "ready-to-launch" : "ready-but-waiting-for-rearm")
-                : "not-ready";
-
-            var cpuText = CpuSampleValid
-                ? CpuPercent.ToString("0.0", CultureInfo.InvariantCulture) + "%"
-                : "unknown";
-
-            return
-                $"state={state}; reason={ReasonCode}; target='{TargetPath}'; targetSupported={TargetSupported}; targetExists={TargetExists}; workstationLocked={WorkstationLocked}; sessionOk={SessionOk}; idle={IdleSeconds}s/{RequiredIdleSeconds}s; cpu={cpuText}/{CpuThresholdPercent}%; cooldownOk={CooldownOk}; cooldownRemaining={CooldownRemainingSeconds.ToString("0.0", CultureInfo.InvariantCulture)}s; armed={armed}.";
-        }
-    }
 
     public TrayAppContext()
     {
@@ -1146,11 +1081,52 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void OnTick()
     {
+        // Reject a re-entrant tick outright.
+        //
+        // Process.Start with UseShellExecute = true calls ShellExecuteEx, which PUMPS MESSAGES, so
+        // a WM_TIMER can be dispatched and re-enter this method while the outer call is still
+        // inside the launch path. That was already survivable -- the nested tick hits
+        // _launchingSerialized and skips the launch -- but it is not survivable now that the CPU
+        // delta sampler is advanced at the top: two samples inside one timer period halve the
+        // window the guard is measured over and hand the outer tick a sub-second reading.
+        //
+        // Re-entry is always on the SAME thread (a nested pump), so a plain bool would do; the
+        // Interlocked matches _launchingSerialized and _shutDownSerialized and costs nothing.
+        // Suppressed ticks cannot pile up: WM_TIMER is synthesised on demand, not queued.
+        if (Interlocked.Exchange(ref _tickInProgress, 1) != 0)
+        {
+            return;
+        }
+
         // `finally` rather than a statement at the end of the try: two of the three exits from
         // this method are early returns, and a finally still runs for those.
         var tickThrew = false;
         try
         {
+            // Sample the CPU FIRST -- above the running-target early return, and above
+            // TryRepairHooksIfNeeded too.
+            //
+            // CpuUsageMonitor is a DELTA sampler: every reading covers the span since the previous
+            // call, so the only thing keeping the window at five seconds is being called every five
+            // seconds. A tick that skips the sample does not miss one, it silently WIDENS the next.
+            // v2.5.0 fixed exactly this one level down, by hoisting the sample above the early
+            // returns inside EvaluateLaunchReadiness -- but `if (running) return;` is outside that
+            // method, so for the entire run of a launched target the sampler was never advanced.
+            // After a four-hour screensaver the next reading was a four-hour average, which sits
+            // under any threshold, so the CPU guard stopped guarding at precisely the tick that
+            // decides whether to relaunch.
+            //
+            // Above TryRepairHooksIfNeeded specifically because that drains deferred hook logs and
+            // can therefore throw out of Logger. A failing-tick episode must still advance the
+            // sampler, or it reproduces the very gap this move exists to close.
+            //
+            // The invalid-sample counter moves with it for the same reason: left below the return,
+            // a sampler that died during a long run stayed invisible until the target exited, and
+            // one that recovered during a run kept reporting stuck.
+            var cpuSampleValid = _cpu.TryNextValue(out var cpuPercent);
+            _consecutiveInvalidCpuSamples = NextConsecutiveInvalidCpuSamples(
+                _consecutiveInvalidCpuSamples, cpuSampleValid, MaxConsecutiveInvalidCpuSamples);
+
             PhysicalIdle.TryRepairHooksIfNeeded();
 
             var running = UpdateTrackedProcessState(logStateChange: true);
@@ -1176,7 +1152,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
-            var evaluation = EvaluateLaunchReadiness();
+            var evaluation = EvaluateLaunchReadiness(cpuSampleValid, cpuPercent);
             LogLaunchReadinessIfNeeded(evaluation);
 
             if (evaluation.Ready)
@@ -1280,6 +1256,11 @@ internal sealed class TrayAppContext : ApplicationContext
         }
         finally
         {
+            // Released FIRST, before the recovery log below. If Logger.Info threw, a latch released
+            // after it would stay set for the life of the process and the tick would never run
+            // again -- a silent stop, which is the one failure shape this app keeps having.
+            Interlocked.Exchange(ref _tickInProgress, 0);
+
             if (!tickThrew && _lastTickFailureSignature != null)
             {
                 _lastTickFailureSignature = null;
@@ -1410,19 +1391,25 @@ internal sealed class TrayAppContext : ApplicationContext
 
         Logger.Warn($"Operating in a degraded state. Reason='{normalized}' PreviousReason='{previous ?? "(none)"}'.");
 
-        // Rate-limit the balloon but never the log: a fault that flaps between two reasons passes
-        // the dedupe above on every tick, and a balloon every five seconds is an app the user
-        // uninstalls. The long.MinValue guard is not decoration -- subtracting it from
-        // TickCount64 overflows and would make the first notification of the run appear
-        // rate-limited.
+        // Rate-limit the balloon but never the log, and rate-limit it PER REASON.
+        //
+        // A single global timestamp made the interval reason-blind, so a fault that had just
+        // cleared bought five minutes of silence for a DIFFERENT fault arriving inside its window:
+        // the user was told about the first problem and never about the second. That is exactly
+        // the escalation the reason-string dedupe above exists to catch, thrown away one step
+        // later. Keyed per reason, a new fault always gets its own notification while a fault
+        // flapping between two reasons still balloons at most twice per window instead of
+        // every five seconds.
+        //
+        // Absence from the map means "never notified", which also retires the old long.MinValue
+        // sentinel and the TickCount64 overflow footnote that came with it.
         var nowMs = Environment.TickCount64;
-        if (_lastDegradationBalloonMs != long.MinValue
-            && nowMs - _lastDegradationBalloonMs < DegradationBalloonMinIntervalMs)
+        if (!ShouldNotifyDegradation(_degradationNotifiedAtMs, normalized, nowMs, DegradationBalloonMinIntervalMs))
         {
             return;
         }
 
-        _lastDegradationBalloonMs = nowMs;
+        RecordDegradationNotification(_degradationNotifiedAtMs, normalized, nowMs, MaxTrackedDegradationReasons);
 
         ShowTrayNotification(
             $"{AppPaths.AppName} is running degraded",
@@ -1430,145 +1417,103 @@ internal sealed class TrayAppContext : ApplicationContext
             ToolTipIcon.Warning);
     }
 
-    private LaunchEvaluation EvaluateLaunchReadiness()
+    // Whether this exact reason may be ballooned now. Pure, so the per-reason rule is testable
+    // without a NotifyIcon: a reason never notified before always passes, and a reason inside its
+    // OWN window is held back without holding back any other reason.
+    internal static bool ShouldNotifyDegradation(
+        IReadOnlyDictionary<string, long> history, string reason, long nowMs, int minIntervalMs)
+    {
+        if (!history.TryGetValue(reason, out var lastNotifiedMs))
+        {
+            return true;
+        }
+
+        return nowMs - lastNotifiedMs >= minIntervalMs;
+    }
+
+    // Records that a reason was just notified, keeping the history bounded.
+    //
+    // Pure apart from the dictionary it is handed, which is what makes the cap testable without
+    // constructing a tray application. On overflow the whole map is dropped rather than evicting
+    // one entry: with a bounded set of literal reasons this is unreachable, and if it ever is
+    // reached the cost is one extra balloon per reason, which is the right way for this to fail.
+    internal static void RecordDegradationNotification(
+        Dictionary<string, long> history, string reason, long nowMs, int maxTrackedReasons)
+    {
+        if (!history.ContainsKey(reason) && history.Count >= maxTrackedReasons)
+        {
+            history.Clear();
+        }
+
+        history[reason] = nowMs;
+    }
+
+    private LaunchEvaluation EvaluateLaunchReadiness(bool cpuSampleValid, double cpuPercent)
     {
         var targetPath = TargetFilePolicy.NormalizePath(_cfg.AppPath);
 
-        var evaluation = new LaunchEvaluation
+        // Short-circuit deliberately: targetExists guards a filesystem probe behind
+        // targetSupported, which guards it behind hasTarget, so a missing or unsupported target
+        // never touches the disk. LaunchDecision asks about the three in that same order, so
+        // passing false for a check that was never reached cannot change the answer.
+        var hasTarget = !string.IsNullOrWhiteSpace(targetPath);
+        var targetSupported = hasTarget && TargetFilePolicy.IsSupportedTarget(targetPath);
+        var targetExists = targetSupported && TargetExistsCached(targetPath);
+
+        var result = LaunchDecision.Evaluate(new LaunchInputs
         {
             TargetPath = targetPath,
-            HasTarget = !string.IsNullOrWhiteSpace(targetPath),
-            // No Math.Max clamps here. ConfigManager.NormalizeInPlace runs on BOTH Load and
-            // Save and is the single enforcement point for these bounds (IdleMinutes >= 1, CPU
-            // threshold snapped to the allowed steps); the menu handlers only ever assign values
-            // from those same fixed sets. Clamping again here could not change any reachable
-            // value and disguised where the invariant is actually kept.
+            HasTarget = hasTarget,
+            TargetSupported = targetSupported,
+            TargetExists = targetExists,
+            IdleSeconds = GetIdleSeconds(),
             RequiredIdleSeconds = _cfg.IdleMinutes * 60,
+            CpuSampleValid = cpuSampleValid,
+            CpuPercent = cpuPercent,
             CpuThresholdPercent = _cfg.CpuThresholdPercent,
-            InputIdleOk = false,
-            CpuOk = false
-        };
 
-        // Sample idle and CPU FIRST, before any early return.
-        //
-        // CpuUsageMonitor is a DELTA sampler: each reading covers the span since the previous
-        // call. Sampling only on the all-checks-passed path meant that after a four-hour target
-        // run, or hours with a target on an unreachable share, the next "CPU usage" reading was a
-        // four-hour average rather than a five-second one. A multi-hour average sits under the
-        // 10-50% gate almost always, so the CPU guard quietly stopped guarding at exactly the
-        // moment it mattered: the first evaluation after a gap.
-        //
-        // Measuring idle here too is what lets the re-arm logic below tell "the user is active"
-        // apart from "we never looked".
-        evaluation.IdleSeconds = GetIdleSeconds();
-        evaluation.IdleMeasured = true;
-        evaluation.CpuSampleValid = _cpu.TryNextValue(out var cpuPercent);
-        evaluation.CpuPercent = evaluation.CpuSampleValid ? cpuPercent : 0;
-        evaluation.InputIdleOk = evaluation.IdleSeconds >= evaluation.RequiredIdleSeconds;
-        evaluation.CpuOk = evaluation.CpuSampleValid && evaluation.CpuPercent <= evaluation.CpuThresholdPercent;
+            // ONE volatile read. Reading _workstationLocked twice would let a lock or unlock land
+            // between the two reads and produce an evaluation that describes no state the machine
+            // was ever in -- "locked" in the log line and "session ok" in the decision, or the
+            // reverse.
+            WorkstationLocked = _workstationLocked,
+            AllowLaunchWhileLocked = _cfg.AllowLaunchWhileLocked,
+            LastLaunchUtc = _lastLaunchUtc,
+            NowUtc = DateTime.UtcNow,
+            MinLaunchCooldownSeconds = MinLaunchCooldownSeconds
+        });
 
-        // Counted here, beside the sampler that produces the samples, so the counter cannot drift
-        // away from its source. Saturating at the threshold rather than incrementing forever: the
-        // only question ever asked of it is ">= MaxConsecutiveInvalidCpuSamples", and a counter
-        // that stops climbing cannot overflow into a negative that would silently clear the fault.
-        if (evaluation.CpuSampleValid)
+        // The clock-warp repair is REPORTED by the pure decision and applied here, so the
+        // persisted value and the log line that explains it stay together at the one place that
+        // owns them. _lastLaunchUtc is written to config.json and survives restart, so this is a
+        // side effect worth keeping visible rather than burying inside the evaluation.
+        if (result.RebaselinedLastLaunchUtc.HasValue)
         {
-            _consecutiveInvalidCpuSamples = 0;
-        }
-        else if (_consecutiveInvalidCpuSamples < MaxConsecutiveInvalidCpuSamples)
-        {
-            _consecutiveInvalidCpuSamples++;
+            Logger.Warn(
+                $"Launch cooldown timestamp is in the future by {result.ClockWarpSeconds:F0}s (clock change or edited config). Re-baselining to now.");
+            _lastLaunchUtc = result.RebaselinedLastLaunchUtc;
         }
 
-        // ONE volatile read, taken into the evaluation and then re-read from there. Reading
-        // _workstationLocked twice would let a lock or unlock land between the two reads and
-        // produce an evaluation that describes no state the machine was ever in -- "locked" in
-        // the log line, "session ok" in the decision, or the reverse.
-        evaluation.WorkstationLocked = _workstationLocked;
-        evaluation.SessionOk = !evaluation.WorkstationLocked || _cfg.AllowLaunchWhileLocked;
+        return result.Evaluation;
+    }
 
-        if (!evaluation.HasTarget)
+    // Advances the stuck-sampler counter by one tick. Pure, so the saturation is testable without
+    // constructing a tray application.
+    //
+    // Saturating rather than free-running: the only question ever asked of this counter is
+    // ">= MaxConsecutiveInvalidCpuSamples", and a counter that keeps climbing is one that can
+    // overflow into a negative and silently clear the fault it exists to report. The comparison is
+    // written ">= maxSamples" rather than "< maxSamples then increment" so that int.MaxValue
+    // saturates DOWN to the cap instead of wrapping -- unreachable today, but this is now a public
+    // function of its arguments and the test says so.
+    internal static int NextConsecutiveInvalidCpuSamples(int current, bool sampleValid, int maxSamples)
+    {
+        if (sampleValid)
         {
-            evaluation.ReasonCode = LaunchReasonCode.NoTargetConfigured;
-            return evaluation;
-        }
-
-        evaluation.TargetSupported = TargetFilePolicy.IsSupportedTarget(targetPath);
-        if (!evaluation.TargetSupported)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.SelectedTargetUnsupported;
-            return evaluation;
-        }
-
-        evaluation.TargetExists = TargetExistsCached(targetPath);
-        if (!evaluation.TargetExists)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.SelectedTargetMissing;
-            return evaluation;
+            return 0;
         }
 
-        if (_lastLaunchUtc.HasValue)
-        {
-            var delta = (DateTime.UtcNow - _lastLaunchUtc.Value).TotalSeconds;
-
-            // A NEGATIVE delta means the wall clock moved backwards relative to the stored
-            // timestamp: an NTP correction, a VM snapshot restore, a dead CMOS battery, or a
-            // hand-edited LastLaunchUtc missing its 'Z' (which ToUniversalTime() then shifts
-            // forward by the local offset). Without this clamp the cooldown stayed active for the
-            // full magnitude of the jump -- hours or years -- and because _lastLaunchUtc is
-            // persisted to config.json it SURVIVED RESTART, with nothing in the tray to show why
-            // the app had stopped launching. Re-baseline and carry on.
-            if (delta < 0)
-            {
-                Logger.Warn(
-                    $"Launch cooldown timestamp is in the future by {(-delta):F0}s (clock change or edited config). Re-baselining to now.");
-                _lastLaunchUtc = DateTime.UtcNow;
-                delta = 0;
-            }
-
-            if (delta < MinLaunchCooldownSeconds)
-            {
-                evaluation.CooldownOk = false;
-                evaluation.CooldownRemainingSeconds = MinLaunchCooldownSeconds - delta;
-            }
-        }
-
-        // The lock label goes HERE -- first in this cascade -- and in neither of the two places it
-        // might look like it belongs.
-        //
-        // Not at the top of the method: that would report "Locked" for a target that does not
-        // exist, and the user would wait out a lock state that was never the problem while the
-        // real fault stayed invisible for as long as the machine stayed locked.
-        //
-        // Not before the cooldown block above either: that block self-heals a _lastLaunchUtc that
-        // has moved into the future, and that value is PERSISTED to config.json. Skipping the
-        // repair while locked would let a clock jump strand the cooldown across restarts.
-        if (!evaluation.SessionOk)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.WorkstationLocked;
-        }
-        else if (!evaluation.CooldownOk)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.LaunchCooldownActive;
-        }
-        else if (!evaluation.InputIdleOk)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.WaitingForInputIdle;
-        }
-        else if (!evaluation.CpuSampleValid)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.CpuSampleUnavailable;
-        }
-        else if (!evaluation.CpuOk)
-        {
-            evaluation.ReasonCode = LaunchReasonCode.CpuAboveThreshold;
-        }
-        else
-        {
-            evaluation.ReasonCode = LaunchReasonCode.Ready;
-        }
-
-        return evaluation;
+        return current >= maxSamples ? maxSamples : current + 1;
     }
 
     // Existence of the target, cached for TargetExistsCacheTtlMs.
@@ -2291,6 +2236,17 @@ internal sealed class TrayAppContext : ApplicationContext
         _trayIconObj = null;
 
         try { _menu.Dispose(); } catch { /* ignore */ }
+
+        // Clear the static LAST. It is the same category of GC root as the SystemEvents handlers
+        // released at the top of this method: while it is set, a torn-down context and everything
+        // it owns stay reachable for the life of the process. Benign today (single instance, and
+        // the process exits immediately afterwards) but it is the one root this method was
+        // otherwise careful about and then left behind.
+        //
+        // Last, not first: Program.cs's fatal handlers call EmergencyHideTrayIcon through this
+        // field, and clearing it early would take away the tray-icon cleanup during the window
+        // where the rest of the teardown can still throw.
+        _live = null;
     }
 
     protected override void Dispose(bool disposing)

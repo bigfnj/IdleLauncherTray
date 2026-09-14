@@ -5,12 +5,12 @@ using System.Runtime.CompilerServices;
 namespace IdleLauncherTray.Tests.Sut;
 
 /// <summary>
-/// Mirror of the product's <c>TrayAppContext.LaunchEvaluation</c>.
+/// Mirror of the product's <c>LaunchEvaluation</c>.
 /// <para>
-/// The record is a <c>private</c> type nested inside <c>TrayAppContext</c>, so it is doubly out
-/// of reach: no accessibility change on the product would expose it, and constructing its owner
-/// would build a real <c>NotifyIcon</c>, install real input hooks and start a real timer. The
-/// record itself is pure state plus three derived members, and those are the interesting part —
+/// The record used to be a <c>private</c> type nested inside <c>TrayAppContext</c>. It now lives
+/// in its own file so that <c>LaunchDecision</c> can produce it without a WinForms context in
+/// scope, but it is still <c>internal</c>, so the reflection facade is still how the suite reaches
+/// it. The record is pure state plus three derived members, and those are the interesting part —
 /// <c>Ready</c> in particular decides whether the app launches into a locked desktop.
 /// </para>
 /// <para>
@@ -22,11 +22,7 @@ namespace IdleLauncherTray.Tests.Sut;
 /// </summary>
 internal sealed class LaunchEvaluationProxy
 {
-    private static readonly Type OwnerType = Product.TypeNamed("TrayAppContext");
-
-    private static readonly Type EvaluationType =
-        OwnerType.GetNestedType("LaunchEvaluation", BindingFlags.NonPublic)
-        ?? throw new MissingMemberException(OwnerType.FullName, "LaunchEvaluation");
+    private static readonly Type EvaluationType = Product.TypeNamed("LaunchEvaluation");
 
     private static readonly MethodInfo StateKeyMethod =
         EvaluationType.GetMethod("StateKey", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
@@ -37,6 +33,9 @@ internal sealed class LaunchEvaluationProxy
         ?? throw new MissingMethodException(EvaluationType.FullName, "Describe");
 
     internal LaunchEvaluationProxy() => Instance = Activator.CreateInstance(EvaluationType, nonPublic: true)!;
+
+    /// <summary>Wraps an evaluation the product already produced, e.g. from <c>LaunchDecision</c>.</summary>
+    internal LaunchEvaluationProxy(object instance) => Instance = instance;
 
     internal object Instance { get; }
 
