@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -241,6 +243,105 @@ internal static class Logger
 }
 
 /// <summary>
+/// Mirror of the two <c>private static</c> classifiers on the product's
+/// <c>IdleLauncherTray.TrayAppContext</c>. They decide whether a failed launch is retried, and
+/// the retry costs a <c>Thread.Sleep</c> on the UI thread — so a misclassification is a visibly
+/// frozen tray menu in exchange for an attempt that cannot succeed.
+/// <para>
+/// Reached by reflection because constructing a <c>TrayAppContext</c> would build a real tray
+/// icon, install real input hooks and start a real timer. The methods are static and pure, so
+/// nothing about the owner is needed to exercise them.
+/// </para>
+/// </summary>
+internal static class LaunchFailureClassifier
+{
+    private const string TypeName = "TrayAppContext";
+
+    internal static bool IsTransientLaunchFailure(Exception ex) =>
+        (bool)Product.CallStatic(TypeName, nameof(IsTransientLaunchFailure), ex)!;
+
+    internal static bool IsRetryableWin32Error(int nativeErrorCode) =>
+        (bool)Product.CallStatic(TypeName, nameof(IsRetryableWin32Error), nativeErrorCode)!;
+}
+
+/// <summary>
+/// Mirror of the product's <c>IdleLauncherTray.LaunchReasonCode</c> enum, which the test
+/// assembly cannot name because the product type is internal.
+/// <para>
+/// <see cref="All"/> is deliberately produced by <see cref="Enum.GetValues(Type)"/> rather than
+/// by a literal list here. That is the entire reason the product's reason codes stopped being
+/// strings: a test that enumerates the real type cannot fall behind a member added tomorrow,
+/// whereas a hand-maintained mirror silently stops covering it and stays green.
+/// </para>
+/// </summary>
+internal static class LaunchReasonCode
+{
+    private const string TypeName = "LaunchReasonCode";
+
+    internal static Type EnumType { get; } = Product.TypeNamed(TypeName);
+
+    /// <summary>Every declared member, boxed as the product enum type.</summary>
+    internal static IReadOnlyList<object> All { get; } = Enum.GetValues(EnumType).Cast<object>().ToArray();
+
+    internal static IReadOnlyList<string> Names { get; } = Enum.GetNames(EnumType);
+
+    internal static object Named(string name) => Enum.Parse(EnumType, name);
+}
+
+/// <summary>
+/// Mirror of the product's <c>IdleLauncherTray.TrayStatusText</c>.
+/// <para>
+/// <c>FormatDuration</c> and <c>Percent</c> are <c>private</c> in the product — they are
+/// implementation details of the three entry points — but they carry length guarantees of their
+/// own, so they are worth pinning directly rather than only through their callers.
+/// </para>
+/// </summary>
+internal static class TrayStatusText
+{
+    private const string TypeName = "TrayStatusText";
+
+    internal static int MaxLength => Product.ReadConst<int>(TypeName, nameof(MaxLength));
+
+    internal static string ForEvaluation(
+        string appName,
+        string? degradationReason,
+        object reasonCode,
+        bool armed,
+        string? targetFileName,
+        int idleSeconds,
+        int requiredIdleSeconds,
+        double cpuPercent,
+        int cpuThresholdPercent) =>
+        (string)Product.CallStatic(
+            TypeName,
+            nameof(ForEvaluation),
+            appName,
+            degradationReason,
+            reasonCode,
+            armed,
+            targetFileName,
+            idleSeconds,
+            requiredIdleSeconds,
+            cpuPercent,
+            cpuThresholdPercent)!;
+
+    internal static string ForRunningTarget(string appName, string? degradationReason, string? targetFileName) =>
+        (string)Product.CallStatic(TypeName, nameof(ForRunningTarget), appName, degradationReason, targetFileName)!;
+
+    internal static string ForTickFailure(string appName) =>
+        (string)Product.CallStatic(TypeName, nameof(ForTickFailure), appName)!;
+
+    internal static string Clamp(string value, int maxLength) =>
+        (string)Product.CallStatic(TypeName, nameof(Clamp), value, maxLength)!;
+
+    internal static string FormatDuration(int seconds) =>
+        (string)Product.CallStatic(TypeName, nameof(FormatDuration), seconds)!;
+
+    internal static string Percent(double value) =>
+        (string)Product.CallStatic(TypeName, nameof(Percent), value)!;
+}
+
+/// <summary>
 /// Strongly-typed view over an <c>IdleLauncherTray.AppConfig</c> instance, which the
 /// test assembly cannot name because the type is internal to the product.
 /// </summary>
@@ -276,6 +377,8 @@ internal sealed class ConfigProxy
     internal bool BlockInjectedWhileRunning { get => Get<bool>(); set => Set(value); }
 
     internal bool LockPcOnAppClose { get => Get<bool>(); set => Set(value); }
+
+    internal bool AllowLaunchWhileLocked { get => Get<bool>(); set => Set(value); }
 
     internal bool GamepadCountsAsActivity { get => Get<bool>(); set => Set(value); }
 

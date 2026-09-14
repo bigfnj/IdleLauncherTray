@@ -23,6 +23,23 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## Unreleased
+
+Three changes, all of them about the app telling the truth about itself.
+
+- **The tray tooltip now reports state.** Hover the icon and it says what the launcher is doing:
+  `Idle 3:20/5:00`, `CPU 37% > 10%`, `Target missing: app.exe`, `Disarmed until you use the PC`,
+  `Running app.exe`. When something is broken rather than merely waiting, the line starts with
+  `DEGRADED -` and a balloon appears at most once every five minutes. A monitor loop that throws
+  now says `DEGRADED - monitor tick failed` instead of leaving an app that has silently stopped
+  launching looking identical to one that is patiently waiting.
+- **Launching is blocked while the PC is locked.** The password typed on the secure desktop never
+  reaches the low-level hooks, so a locked machine looks fully idle no matter who is standing at
+  it. **Options → Allow launching while the PC is locked** opts back in; it is off by default.
+- **Run Now no longer disarms the launcher.** Clicking Run Now and then walking away used to
+  switch automatic launching off for the entire away period, because the re-arm only happens after
+  fresh user activity and there is none. Automatic launches still disarm.
+
 ## v2.5 highlights
 
 Version 2.5 is a correctness pass over the idle state machine, driven by two read-only audits. The
@@ -105,8 +122,9 @@ The tray menu exposes:
   - Block injected input while running
   - Lock PC on App Close
   - Count gamepad input as activity
+  - Allow launching while the PC is locked (off by default)
   - Choose / enable / reset custom tray icon
-- **Run Now**
+- **Run Now** — launches immediately and leaves automatic launching armed
 - **Uninstall (remove settings + startup)**
 - **Exit**
 
@@ -147,6 +165,14 @@ When **Options -> Lock PC on App Close** is enabled, IdleLauncherTray calls the 
 This is intentionally limited to targets launched automatically by the idle trigger. A manual **Run Now** launch does not lock the PC on close.
 
 Because the app tracks the immediate process returned by Windows, launcher stubs, shortcuts, scripts, installers, or batch files that spawn a child process and exit immediately may not behave exactly like a long-running direct `.exe` or `.scr`. In those cases the workstation lock is based on the tracked process handle that was actually returned.
+
+## Launching while the PC is locked
+
+By default IdleLauncherTray will not launch while the workstation is locked. The reason is that it cannot tell the difference: the password typed on the secure desktop never reaches a `WH_KEYBOARD_LL` hook, so a locked machine reports the full lock duration as idle time whether nobody is there or somebody is signing in right now.
+
+Lock and unlock are observed through `SystemEvents.SessionSwitch`, which also covers RDP connect/disconnect and console connect/disconnect (fast user switching). Sign-in and sign-out of *other* sessions are deliberately ignored, because they say nothing about this one.
+
+**Options → Allow launching while the PC is locked** turns the gate off for anyone who wants a screensaver or a batch job to start behind the lock screen. If the subscription itself fails at startup, the tray tooltip reports `DEGRADED - lock detection off` rather than leaving a gate that silently enforces nothing.
 
 ## Logging
 

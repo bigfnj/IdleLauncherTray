@@ -17,6 +17,9 @@ dotnet test IdleLauncherTray.sln -c Release
 | `CpuUsageMonitor` | the FILETIME halves combining without sign extension, the first-sample priming, the divide-by-zero guard when two samples land in one clock tick, the counter-regression re-baseline for each of the three counters independently, and the idle-exceeds-total clamp |
 | `AppPaths` | the `IDLELAUNCHERTRAY_DATA_DIR` override, the fall-back to `%APPDATA%`, and the canary described below |
 | `PhysicalIdle` hook liveness | the rule that decides a hook was silently dropped — that an idle user is never reported as one at any tick count, that an unusable `GetLastInputInfo` reading is not evidence, the grace and tick thresholds, that both callbacks move the heartbeat even when told to pass the event straight through, the reason strings fitting the tray tooltip, and that an external-activity report advances the idle clock without ever moving it backwards |
+| `TrayStatusText` | that every `LaunchReasonCode` renders inside the 63-character cap for `int.MaxValue` durations, 100% CPU, a 300-character target name and a 300-character app name; that each reason code produces a distinct body and only `Unknown` reaches "Status unknown"; the precedence order (degraded beats everything, a setup fault beats "disarmed", "disarmed" beats "ready"); that a cut never splits a surrogate pair; and that the duration and percentage helpers are total |
+| `TrayAppContext.LaunchEvaluation` | that `Ready` is false for a locked workstation and true when launching while locked is allowed, that `Ready` ignores `ReasonCode` entirely, and the exact `StateKey` string — the reason codes became an enum, which silently rebinds the `string.Join` overload |
+| `TrayAppContext`'s launch-failure classifier | which exceptions earn the one transient retry: `IOException` and `UnauthorizedAccessException` yes, `FileNotFoundException` no despite deriving from `IOException`, and the shell's `Win32Exception` codes split between "busy" and "settled" |
 
 ## What is NOT covered
 
@@ -24,12 +27,20 @@ This suite protects the pure functions. It does not protect the app.
 
 - **`TrayAppContext`** — the whole tray lifecycle: the context menu, the idle poll timer,
   launching the target process, the launch cooldown, workstation lock on close, the
-  uninstall flow. It needs a window and a message pump.
+  uninstall flow. It needs a window and a message pump. Its pure parts are reached
+  individually: the `LaunchEvaluation` record and the two static launch-failure
+  classifiers are tested, the instance methods around them are not.
 - **`PhysicalIdle`'s hooks themselves** — installing them, the injected-input filter, XInput
   gamepad polling, and the 5 s tick that drives the drop detector. Those need real input, a
   message pump and a global hook this suite must not install. What *is* covered is the
   decision the tick makes: `IsHookDropSuspected` is a pure function of two clock readings
   and a tick count, so every case is reachable as an argument.
+- **The `SessionSwitch` subscription** — that lock and unlock actually move the flag, and
+  that the handler survives being called on the SystemEvents thread. Raising a real
+  session switch means locking the machine, so `SMOKE_TEST.md` covers it.
+- **The tooltip wiring** — `TrayStatusText` is tested exhaustively, but that `OnTick`
+  calls it from all three places, and that `NotifyIcon.Text` accepts the result, needs a
+  tray icon.
 - **`StartupManager`** — writes to `HKCU\...\Run`. Testable in principle, untested here
   because it mutates real machine state.
 - **`Logger`** — only its path is asserted, not rotation or its locking.
