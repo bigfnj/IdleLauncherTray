@@ -132,6 +132,66 @@ public sealed class ConfigManagerTests
     }
 
     [Theory]
+    [InlineData(int.MaxValue)]
+    [InlineData(40_000_000)]
+    [InlineData(35_791_395)]
+    public void Load_ClampsIdleMinutesBelowTheValueThatOverflowsTheSecondsConversion(int stored)
+    {
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile($"{{ \"IdleMinutes\": {stored} }}");
+
+        var minutes = ConfigManager.Load().IdleMinutes;
+
+        // The bound that matters is not the constant, it is that TrayAppContext can still compute
+        // `IdleMinutes * 60` into an int without wrapping. An unclamped 40,000,000 becomes about
+        // -1.89 billion seconds, and readiness tests `IdleSeconds >= RequiredIdleSeconds`, so a
+        // negative threshold is satisfied on every tick and the app launches its target forever.
+        // Assert the real property rather than the clamp value, so this test still means something
+        // if the constant is ever retuned.
+        Assert.Equal(stored > ConfigManager.MaximumIdleMinutes ? ConfigManager.MaximumIdleMinutes : stored, minutes);
+        Assert.True(
+            (long)minutes * 60 <= int.MaxValue,
+            $"IdleMinutes={minutes} still overflows when converted to seconds.");
+        Assert.True(minutes * 60 > 0, $"IdleMinutes={minutes} produced a non-positive second count.");
+    }
+
+    [Theory]
+    [InlineData(int.MaxValue)]
+    [InlineData(2_000_000_000)]
+    public void Load_ClampsAnAbsurdFailSafeWindow(int stored)
+    {
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile($"{{ \"SystemIdleFailSafeWindowMs\": {stored} }}");
+
+        // Unclamped this fails the opposite way to the idle threshold: the window decides when a
+        // smaller GetLastInputInfo reading is trusted over the hook clock, so an enormous value
+        // means it is always trusted and measured idle can never accumulate. The app stops
+        // launching entirely and reports nothing.
+        Assert.Equal(ConfigManager.MaximumSystemIdleFailSafeWindowMs, ConfigManager.Load().SystemIdleFailSafeWindowMs);
+    }
+
+    [Fact]
+    public void Load_WithAnUnreadableFile_MovesItAsideInsteadOfLettingItBeOverwritten()
+    {
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile("{ \"IdleMinutes\": 42, \"AppPath\": \"C:\\\\tools\\\\real.exe\"");  // truncated on purpose
+
+        var loaded = ConfigManager.Load();
+
+        // Defaults are returned so the app still starts.
+        Assert.Equal(5, loaded.IdleMinutes);
+
+        // The original is preserved. Without this the caller's very next Save -- which fires
+        // whenever RunAtStartup disagrees with the registry, the normal case for this app --
+        // writes those defaults straight over the user's real settings, and the only trace is one
+        // line in a log nobody opens.
+        var quarantined = Directory.GetFiles(Path.GetDirectoryName(data.ConfigFile)!, "config.corrupt-*.json");
+        Assert.True(quarantined.Length == 1, $"expected exactly one quarantined config, found {quarantined.Length}");
+        Assert.Contains("C:\\\\tools\\\\real.exe", File.ReadAllText(quarantined[0]), StringComparison.Ordinal);
+        Assert.False(File.Exists(data.ConfigFile), "the unreadable config should have been moved, not copied");
+    }
+
+    [Theory]
     [InlineData(int.MinValue, 10)]
     [InlineData(-40, 10)]
     [InlineData(0, 10)]

@@ -806,6 +806,24 @@ internal sealed class TrayAppContext : ApplicationContext
                 $"Failed to subscribe to session switch notifications. Lock detection is off and the tray tooltip will report the degradation. Error='{ex.Message}'.");
         }
 
+        // Resume from sleep or hibernate has the same shape as an unlock: the machine was not
+        // running our hooks while it was suspended, and whatever the user did to wake it never
+        // reached WH_KEYBOARD_LL. Without this, the idle clock carries the entire suspend across
+        // the resume -- so a machine that slept overnight is "idle for nine hours" the instant it
+        // wakes and launches the target before the user has touched anything. It also clears the
+        // hook-drop suspicion the gap would otherwise create.
+        //
+        // Best-effort and separate from the block above: losing resume handling is a smaller
+        // failure than losing lock detection, and it should not flip the tooltip to degraded.
+        try
+        {
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Failed to subscribe to power mode notifications; resume-from-sleep will not reset the idle clock. Error='{ex.Message}'.");
+        }
+
         // Monitor loop
         _timer = new System.Windows.Forms.Timer { Interval = CheckIntervalSeconds * 1000 };
         _timer.Tick += (_, _) => OnTick();
@@ -1015,7 +1033,12 @@ internal sealed class TrayAppContext : ApplicationContext
                     // report the entire lock duration as idle time. A tick landing in the gap
                     // between a cleared flag and a not-yet-reset clock would see "unlocked and
                     // hours idle" and launch the target one tick after the user signed back in.
-                    // TODO(merge): call PhysicalIdle.NotifyExternalActivity here when feat/hook-drop-detection merges.
+                    //
+                    // This also clears the hook-drop suspicion the lock necessarily created:
+                    // to the drop detector, "GetLastInputInfo advanced but no callback fired"
+                    // is exactly what a secure-desktop sign-in looks like, and without this the
+                    // app would report a degraded hook after every unlock.
+                    PhysicalIdle.NotifyExternalActivity($"session became available ({e.Reason})");
                     _workstationLocked = false;
                     Logger.Info($"Session became available; automatic launching is allowed again. Reason={e.Reason}.");
                     break;
@@ -1040,6 +1063,37 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 // The logger is the last thing left and it is failing too. Swallowing is the
                 // whole point of this handler: see the note above about process termination.
+            }
+        }
+    }
+
+    // Raised on the SystemEvents notification thread, exactly like OnSessionSwitch, and bound by
+    // the same rules: no WinForms object, and nothing may be allowed to escape, because an
+    // unhandled exception on a non-UI thread terminates the process.
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        try
+        {
+            if (e?.Mode != PowerModes.Resume)
+            {
+                // Suspend and StatusChange say nothing about input reaching our hooks. Notably we
+                // do NOT reset on Suspend: the machine is about to stop running our timer anyway,
+                // and claiming activity at that moment would be a claim we cannot support.
+                return;
+            }
+
+            PhysicalIdle.NotifyExternalActivity("resumed from sleep or hibernate");
+            Logger.Info("Resumed from sleep; idle clock reset so the suspended time does not count as idle.");
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                Logger.Warn($"Failed to handle a power mode notification. Error='{ex.Message}'.");
+            }
+            catch
+            {
+                // Same reasoning as the session handler above.
             }
         }
     }
@@ -1246,7 +1300,29 @@ internal sealed class TrayAppContext : ApplicationContext
     // "most changes what the user should expect from the app", not "rarest".
     private string? ComposeDegradationReason()
     {
-        // TODO(merge): hook degradation source is added when feat/hook-drop-detection merges.
+        // Hooks first: they are the measurement everything else is derived from. A dropped or
+        // missing hook makes the idle number itself untrustworthy, which is strictly worse than
+        // a gate that is merely not being enforced.
+        //
+        // One call, not a flag plus a string. Two reads could be observed from either side of a
+        // tick and paint "DEGRADED - " with an empty reason, or a stale reason with no flag.
+        string? hookReason;
+        try
+        {
+            hookReason = PhysicalIdle.GetHookDegradationReason();
+        }
+        catch (Exception ex)
+        {
+            // A diagnostic that throws is itself a degradation, and silently treating it as
+            // "healthy" would be the exact failure this whole feature exists to end.
+            Logger.Warn($"Failed to read the hook degradation reason. Error='{ex.Message}'.");
+            return "hook status unreadable";
+        }
+
+        if (!string.IsNullOrWhiteSpace(hookReason))
+        {
+            return hookReason.Trim();
+        }
 
         if (!_sessionSwitchSubscribed)
         {
@@ -2055,14 +2131,21 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private static void LogHookStatus()
     {
-        if (PhysicalIdle.KeyboardHookInstalled && PhysicalIdle.MouseHookInstalled)
+        // Snapshot each volatile ONCE. Reading them again inside the message would let a hook
+        // install between the decision and the description, producing a "degraded" warning that
+        // then reports both hooks as installed -- a log line that contradicts itself is worse
+        // than no log line, because it costs the next reader time before they distrust it.
+        var keyboardInstalled = PhysicalIdle.KeyboardHookInstalled;
+        var mouseInstalled = PhysicalIdle.MouseHookInstalled;
+
+        if (keyboardInstalled && mouseInstalled)
         {
             Logger.Info("Physical idle hooks installed successfully (keyboard and mouse).");
             return;
         }
 
         Logger.Warn(
-            $"Physical idle hook installation is degraded. KeyboardHookInstalled={PhysicalIdle.KeyboardHookInstalled} KeyboardHookError={PhysicalIdle.LastKeyboardHookError} MouseHookInstalled={PhysicalIdle.MouseHookInstalled} MouseHookError={PhysicalIdle.LastMouseHookError} UseSystemIdleFailSafe={PhysicalIdle.UseSystemIdleFailSafe}.");
+            $"Physical idle hook installation is degraded. KeyboardHookInstalled={keyboardInstalled} KeyboardHookError={PhysicalIdle.LastKeyboardHookError} MouseHookInstalled={mouseInstalled} MouseHookError={PhysicalIdle.LastMouseHookError} UseSystemIdleFailSafe={PhysicalIdle.UseSystemIdleFailSafe}.");
     }
 
     private static string DescribeProcess(Process? process)
@@ -2136,6 +2219,9 @@ internal sealed class TrayAppContext : ApplicationContext
         // handle. That is a real leak, and it also means a torn-down instance keeps waking on
         // every lock and unlock.
         try { SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { /* ignore */ }
+
+        // PowerModeChanged is the same kind of static event and leaks the same way.
+        try { SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { /* ignore */ }
 
         try { _timer.Stop(); } catch { /* ignore */ }
         try { _timer.Dispose(); } catch { /* ignore */ }

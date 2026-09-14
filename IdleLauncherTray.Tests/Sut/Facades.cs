@@ -69,6 +69,12 @@ internal static class ConfigManager
 
     internal static void Save(ConfigProxy config) =>
         Product.CallStatic(TypeName, nameof(Save), config.Instance);
+
+    internal static int MaximumIdleMinutes =>
+        Product.ReadConst<int>(TypeName, nameof(MaximumIdleMinutes));
+
+    internal static int MaximumSystemIdleFailSafeWindowMs =>
+        Product.ReadConst<int>(TypeName, nameof(MaximumSystemIdleFailSafeWindowMs));
 }
 
 /// <summary>
