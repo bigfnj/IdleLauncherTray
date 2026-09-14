@@ -82,9 +82,29 @@ internal static class Program
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
-            try { Logger.Error("Unhandled non-UI exception.", e.ExceptionObject as Exception); } catch { /* ignore */ }
+            var ex = e.ExceptionObject as Exception;
+            try { Logger.Error("Unhandled non-UI exception.", ex); } catch { /* ignore */ }
 
             TrayAppContext.EmergencyHideTrayIcon();
+
+            // Tell the user, exactly as the UI-thread handler above does. An unhandled
+            // exception on a background thread is fatal in .NET, so this path ends the process
+            // just as surely -- but without this dialog the tray icon simply disappears with no
+            // explanation, which is indistinguishable from the user having closed it. The whole
+            // diagnostic strategy here is "it is in the log", and the log's location is only
+            // ever revealed by this dialog, so staying silent leaves no route to the evidence.
+            try
+            {
+                MessageBox.Show(
+                    $"IdleLauncherTray hit an unexpected error on a background thread and will exit.\n\nLog file:\n{Logger.LogPath}\n\n{ex?.Message ?? "(no exception details available)"}",
+                    AppPaths.AppName,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+            catch
+            {
+                // ignore
+            }
         };
 
         try

@@ -24,10 +24,20 @@ internal static class Logger
     private static int _writeCount;
     private const int RotationCheckInterval = 10;
 
-    // Cache the resolved log path. AppPaths.BaseDir is computed once at type init, so
-    // there's no point re-running Path.Combine on every Write() call.
+    // The log path is resolved ONCE, deliberately: a log that moved mid-process would split one
+    // run's history across two files. Note that AppPaths.BaseDir is NOT fixed -- it is a live
+    // property that re-reads IDLELAUNCHERTRAY_DATA_DIR on every access (see AppPaths.cs) -- so
+    // this is a snapshot of a moving value, not a cache of a constant.
     private static readonly string _logPath = Path.Combine(AppPaths.BaseDir, $"{AppPaths.AppName}.log");
     public static string LogPath => _logPath;
+
+    // Derived from _logPath, NOT from AppPaths.BaseDir. Those two can disagree: BaseDir is live,
+    // _logPath is a snapshot. Creating the directory from the live value while appending to the
+    // snapshot path meant EnsureDirectoryExists could succeed on one directory, latch _dirCreated
+    // to true forever, and leave every File.AppendAllText failing against a directory that was
+    // never created -- with the exception swallowed, so logging died permanently and silently.
+    // Deriving both from the same string makes that disagreement unrepresentable.
+    private static readonly string _logDir = Path.GetDirectoryName(_logPath) ?? AppPaths.BaseDir;
 
     public static void Info(string message)
     {
@@ -105,7 +115,7 @@ internal static class Logger
 
             try
             {
-                Directory.CreateDirectory(AppPaths.BaseDir);
+                Directory.CreateDirectory(_logDir);
                 _dirCreated = true;
             }
             catch

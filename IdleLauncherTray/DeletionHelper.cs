@@ -224,22 +224,33 @@ internal static class DeletionHelper
         }
     }
 
-    // Defence-in-depth: the only legitimate use of this helper is to delete the
-    // app's own %APPDATA%\IdleLauncherTray folder during portable uninstall.
-    // Restricting to that exact path means that even if an attacker is able to
-    // launch IdleLauncherTray.exe with --cleanup-folder pointing somewhere else,
-    // we refuse to operate on arbitrary directories. The filesystem-root check
-    // is kept as a redundant safety net.
+    // Defence-in-depth against a MISTAKE -- a wrong argument, a bad path, a future caller that
+    // passes something unexpected. It confines the delete to the app's own data directory during
+    // portable uninstall, and the filesystem-root check is a redundant net under that.
+    //
+    // It is NOT an attacker boundary, and an earlier version of this comment wrongly claimed it
+    // was. The allowed path is AppPaths.BaseDir, which resolves IDLELAUNCHERTRAY_DATA_DIR live on
+    // every read -- so anyone who can choose this process's --cleanup-folder argument can also
+    // choose its environment, point BaseDir at the same place, and satisfy the check. That buys
+    // them nothing they did not already have: a caller who can set a child's environment can call
+    // Directory.Delete themselves. The guard's real value is catching our own errors, so describe
+    // it as that rather than as a security control someone might rely on.
+    //
+    // Every rejection logs. A guard that refuses silently is indistinguishable from a guard that
+    // was never reached, and ScheduleFolderDelete returns void, so the log is the caller's ONLY
+    // evidence that the uninstall it promised did not happen.
     private static bool IsSafeDeleteTarget(string? folderPath)
     {
         if (string.IsNullOrWhiteSpace(folderPath))
         {
+            LogRefusal("the requested path was null, empty or whitespace.");
             return false;
         }
 
         var root = Path.GetPathRoot(folderPath);
         if (string.IsNullOrWhiteSpace(root))
         {
+            LogRefusal($"the requested path has no root, so it is relative. Requested='{folderPath}'.");
             return false;
         }
 
@@ -248,6 +259,7 @@ internal static class DeletionHelper
 
         if (string.Equals(normalizedPath, normalizedRoot, StringComparison.OrdinalIgnoreCase))
         {
+            LogRefusal($"the requested path is a filesystem root. Requested='{normalizedPath}'.");
             return false;
         }
 
@@ -255,23 +267,29 @@ internal static class DeletionHelper
         var expectedBaseDir = NormalizeFolderPath(AppPaths.BaseDir);
         if (string.IsNullOrWhiteSpace(expectedBaseDir))
         {
+            LogRefusal("AppPaths.BaseDir did not resolve to a usable directory, so there is nothing safe to compare against.");
             return false;
         }
 
         if (!string.Equals(normalizedPath, expectedBaseDir, StringComparison.OrdinalIgnoreCase))
         {
-            try
-            {
-                Logger.Warn($"DeletionHelper refused to operate on a path outside AppPaths.BaseDir. Requested='{normalizedPath}' Expected='{expectedBaseDir}'.");
-            }
-            catch
-            {
-                // Best effort.
-            }
+            LogRefusal($"the requested path is outside AppPaths.BaseDir. Requested='{normalizedPath}' Expected='{expectedBaseDir}'.");
             return false;
         }
 
         return true;
+    }
+
+    private static void LogRefusal(string because)
+    {
+        try
+        {
+            Logger.Warn($"DeletionHelper refused to delete: {because}");
+        }
+        catch
+        {
+            // Best effort. Logging must never be the reason a refusal turns into a crash.
+        }
     }
 
     private static bool TryDeleteFolderWithRetries(string folderPath, int initialWaitMs)
@@ -327,7 +345,25 @@ internal static class DeletionHelper
                 rootDirectory.Attributes = FileAttributes.Normal;
             }
 
-            foreach (var entry in Directory.EnumerateFileSystemEntries(folderPath, "*", SearchOption.AllDirectories))
+            // AttributesToSkip must include ReparsePoint. Directory.Delete(recursive: true)
+            // unlinks a junction rather than following it, so the DELETE stays inside the tree --
+            // but this attribute walk did not. A junction or directory symlink dropped inside the
+            // data directory was traversed, and File.SetAttributes stripped ReadOnly/Hidden/System
+            // from every file on the far side of it: an unlogged write to an arbitrary tree, from
+            // a helper whose entire job is to stay inside one folder.
+            //
+            // Setting AttributesToSkip explicitly also deliberately drops the Hidden|System skip
+            // that this overload defaults to, preserving the legacy SearchOption behaviour of
+            // visiting hidden and system files -- they are ours, inside our own directory, and
+            // clearing their attributes is the whole point.
+            var walkOptions = new EnumerationOptions
+            {
+                RecurseSubdirectories = true,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+                IgnoreInaccessible = true
+            };
+
+            foreach (var entry in Directory.EnumerateFileSystemEntries(folderPath, "*", walkOptions))
             {
                 try
                 {
