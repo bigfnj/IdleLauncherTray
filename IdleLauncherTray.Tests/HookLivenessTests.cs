@@ -1,15 +1,18 @@
-namespace IdleLauncherTray.Tests;
-
 using System;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 using IdleLauncherTray.Tests.Sut;
 
-// PhysicalIdle is the one product type that is public, so unlike every other facade in
-// Sut/ its name is already visible from this namespace -- and a type in the enclosing
-// IdleLauncherTray namespace outranks an alias declared at file scope, which is why these
-// directives sit INSIDE the namespace declaration instead of above it. Without the alias
-// every call below binds to the product directly, sees only its public surface, and skips
-// the reflection the rest of this suite deliberately goes through.
-using PhysicalIdle = IdleLauncherTray.Tests.Sut.PhysicalIdle;
+namespace IdleLauncherTray.Tests;
+
+// These directives used to sit INSIDE the namespace declaration, with a
+// `using PhysicalIdle = IdleLauncherTray.Tests.Sut.PhysicalIdle;` alias under them. That was
+// a workaround for the product type being the assembly's one `public` type: a bare
+// `PhysicalIdle` here resolved out through the enclosing IdleLauncherTray namespace, found
+// the product, and bound to it directly -- skipping the reflection facade every other test
+// file goes through. The product type is `internal` now, so that name is not accessible from
+// this assembly at all and the import below is the only `PhysicalIdle` in scope. The header
+// matches every other file in the suite again.
 
 /// <summary>
 /// Covers the detector for a hook Windows dropped without telling us: the callback stops
@@ -37,6 +40,26 @@ public sealed class HookLivenessTests
     // The tray ticks every 5 s (TrayAppContext.CheckIntervalSeconds), and the tick is the
     // only thing that advances the detector.
     private const int TrayTickMs = 5000;
+
+    // The evidence shape used by the counter tests below: Windows saw input a moment ago and
+    // our callback has not run for two minutes. That pair is only possible if input stopped
+    // reaching us, and it clears HookSilenceGraceMs by more than a factor of ten.
+    private const double EvidenceSystemIdleMs = 0;
+    private const long EvidenceCallbackAgeMs = 120_000;
+
+    // How long a thread that MUST be blocked is given to prove it is not finishing. Long
+    // enough that a scheduling hiccup cannot be mistaken for exclusion, short enough that
+    // three of these cost well under a second.
+    private const int BlockedProofMs = 200;
+
+    // How long a thread is given to finish once nothing is in its way.
+    private const int UnblockedJoinMs = 5000;
+
+    // How long a hook callback gets to prove it took no lock at all. Generous by an order of
+    // magnitude on purpose: a callback that waited on the liveness lock would not be slow
+    // here, it would never return, because the test thread holds that lock for the whole
+    // window.
+    private const int CallbackJoinMs = 1000;
 
     [Theory]
     [InlineData(0, false)]
@@ -450,6 +473,280 @@ public sealed class HookLivenessTests
         }
     }
 
+    [Fact]
+    public void NextHookSilenceTicks_WhileEvidenceKeepsArriving_AdvancesOneTickAtATimeAndStopsAtTheCap()
+    {
+        // 0 -> 1 -> 2 -> 3 -> 3. One tick of evidence is worth exactly one tick, so a single
+        // pathological reading cannot jump the counter to the threshold, and the counter
+        // stops at the threshold because ticks past it carry no information and a counter
+        // that only ever grows is one that eventually overflows.
+        Assert.Equal(1, NextTicks(currentTicks: 0));
+        Assert.Equal(2, NextTicks(currentTicks: 1));
+        Assert.Equal(3, NextTicks(currentTicks: 2));
+        Assert.Equal(3, NextTicks(currentTicks: 3));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(99)]
+    public void NextHookSilenceTicks_WhenTheEvidenceStops_ResetsToZeroRatherThanDecaying(int currentTicks)
+    {
+        // A tick that agrees with GetLastInputInfo is proof the hook fired, so the episode is
+        // over -- the counter goes back to zero in one step rather than counting down. Three
+        // consecutive ticks means consecutive.
+        Assert.Equal(0, NextTicks(systemIdleMs: 500, callbackAgeMs: 500, currentTicks));
+    }
+
+    [Theory]
+    [InlineData(60_000)]
+    [InlineData(3_600_000)]
+    [InlineData(28_800_000)]
+    public void NextHookSilenceTicks_OnACompletelyIdleMachine_StaysAtZeroHoweverLongTheAbsenceLasts(long idleMs)
+    {
+        // THE case, in counter form. A user who walked away a minute, an hour or a full
+        // working day ago moves neither clock, so the two stay in step and no amount of
+        // elapsed time turns into evidence. If this ever regresses, the app distrusts a
+        // perfectly good hook at precisely the moment it is deciding whether to launch.
+        Assert.Equal(0, NextTicks(idleMs, callbackAgeMs: idleMs, currentTicks: 0));
+        Assert.Equal(0, NextTicks(idleMs, callbackAgeMs: idleMs, currentTicks: 2));
+        Assert.Equal(0, NextTicks(idleMs, callbackAgeMs: idleMs, currentTicks: int.MaxValue));
+    }
+
+    [Theory]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    [InlineData(double.NaN)]
+    [InlineData(-1)]
+    public void NextHookSilenceTicks_WhenTheSystemIdleReadingIsUnusable_ResetsToZero(double systemIdleMs)
+    {
+        // GetSystemIdleMilliseconds answers PositiveInfinity when GetLastInputInfo fails.
+        // Losing the cross-check is not evidence that the hooks failed -- it is evidence of
+        // nothing, and a callback age on its own is exactly what a genuinely idle machine
+        // looks like. Banking a tick for it would let a broken GetLastInputInfo latch the
+        // detector after three ticks on a perfectly healthy machine.
+        Assert.Equal(0, NextTicks(systemIdleMs, callbackAgeMs: 3_600_000, currentTicks: 2));
+    }
+
+    [Fact]
+    public void NextHookSilenceTicks_AtIntMaxValue_SaturatesDownInsteadOfOverflowingNegative()
+    {
+        // The reason the cap is a comparison and not Math.Min(currentTicks + 1, maxTicks):
+        // the ADDITION is what overflows. At int.MaxValue the increment wraps to int.MinValue
+        // and Math.Min then faithfully keeps the negative, leaving the counter permanently
+        // below any threshold -- a detector that has silently disarmed itself, which is the
+        // one failure shape this whole file exists to avoid.
+        int capped = NextTicks(currentTicks: int.MaxValue);
+
+        Assert.Equal(3, capped);
+        Assert.True(capped >= 0, $"The counter overflowed to {capped}.");
+
+        // And with no cap to saturate against, it still must not step past the top of the
+        // range. maxTicks is a parameter, so nothing stops a future caller passing this.
+        Assert.Equal(
+            int.MaxValue,
+            NextTicks(currentTicks: int.MaxValue, maxTicks: int.MaxValue));
+        Assert.Equal(
+            int.MaxValue,
+            NextTicks(currentTicks: int.MaxValue - 1, maxTicks: int.MaxValue));
+    }
+
+    [Fact]
+    public void UpdateHookLivenessState_WhileTheLivenessLockIsHeld_WaitsForIt()
+    {
+        // The tick is the read-modify-write half of the race: it reads the flag, both clocks
+        // and the counter, decides, and writes the counter and the latch back. All of that
+        // has to be one critical section, or a reset landing in the middle of it is undone by
+        // a verdict that was reached before the reset existed.
+        using var hooks = new HookStateScope();
+
+        AssertWaitsForTheLivenessLock("The liveness tick", PhysicalIdle.UpdateHookLivenessState);
+    }
+
+    [Fact]
+    public void NotifyExternalActivity_WhileTheLivenessLockIsHeld_WaitsForIt()
+    {
+        // The unlock resetter. It runs on the SystemEvents thread, and the heartbeat advance
+        // plus the two counter resets are one act: split apart, a tick can read the old
+        // heartbeat, watch all three writes go by, and then put the whole lock/unlock gap
+        // back as fresh evidence.
+        using var hooks = new HookStateScope();
+
+        AssertWaitsForTheLivenessLock(
+            "NotifyExternalActivity",
+            () => PhysicalIdle.NotifyExternalActivity("hook-liveness exclusion test"));
+    }
+
+    [Fact]
+    public void SetHookSilenceExpected_WhenTurnedOnWhileTheLivenessLockIsHeld_WaitsForIt()
+    {
+        // The lock resetter, and the one the tick is blind to: it never touches the
+        // heartbeat, so nothing about the clocks reveals that it happened. Only the counter
+        // resets are inside the lock here -- the _hookSilenceExpected write itself is
+        // deliberately outside it, because it carries an ordering contract with the tray's
+        // own locked flag. So the worker below has already published the flag by the time it
+        // blocks, which is why the flag is put back in the finally.
+        using var hooks = new HookStateScope();
+        try
+        {
+            AssertWaitsForTheLivenessLock(
+                "SetHookSilenceExpected(true)",
+                () => PhysicalIdle.SetHookSilenceExpected(true));
+        }
+        finally
+        {
+            PhysicalIdle.SetHookSilenceExpected(false);
+        }
+    }
+
+    [Fact]
+    public void KeyboardHookCallback_WhileTheLivenessLockIsHeld_StillReturnsImmediately()
+    {
+        // THE requirement, and the one that outranks every other line in this file. A
+        // low-level hook callback runs on the UI thread and blocks ALL system input until it
+        // returns. If it ever waited on the liveness lock, a tick that held that lock would
+        // freeze every keystroke and every mouse movement on the desktop until it finished --
+        // and Windows would then silently drop the hook for overrunning LowLevelHooksTimeout,
+        // turning a measurement fix into the exact fault the detector was built to report.
+        //
+        // It has to be invoked on ANOTHER thread. Monitor is re-entrant, so calling it from
+        // the thread that already owns the lock would sail straight through even if the
+        // callback did take it, and this test would pass while proving nothing.
+        using var hooks = new HookStateScope(keyboardInstalled: false, mouseInstalled: false);
+        PhysicalIdle.LastHookCallbackMilliseconds = PhysicalIdle.MonotonicMilliseconds - 3_600_000;
+        var beforeMs = PhysicalIdle.MonotonicMilliseconds;
+
+        AssertRunsWithoutTheLivenessLock(
+            "The keyboard hook callback",
+            PhysicalIdle.InvokeKeyboardHookCallbackWithNegativeCode);
+
+        // Witness: the callback did its real work while the lock was held, rather than
+        // returning early down some path that never touches the heartbeat at all.
+        Assert.True(
+            PhysicalIdle.LastHookCallbackMilliseconds >= beforeMs,
+            "The callback returned without moving the heartbeat, so it never reached the code under test.");
+    }
+
+    [Fact]
+    public void MouseHookCallback_WhileTheLivenessLockIsHeld_StillReturnsImmediately()
+    {
+        // Same requirement, same reasoning: either callback firing is proof the chain is
+        // alive, so both write the heartbeat and both have to stay off every lock.
+        using var hooks = new HookStateScope(keyboardInstalled: false, mouseInstalled: false);
+        PhysicalIdle.LastHookCallbackMilliseconds = PhysicalIdle.MonotonicMilliseconds - 3_600_000;
+        var beforeMs = PhysicalIdle.MonotonicMilliseconds;
+
+        AssertRunsWithoutTheLivenessLock(
+            "The mouse hook callback",
+            PhysicalIdle.InvokeMouseHookCallbackWithNegativeCode);
+
+        Assert.True(
+            PhysicalIdle.LastHookCallbackMilliseconds >= beforeMs,
+            "The callback returned without moving the heartbeat, so it never reached the code under test.");
+    }
+
+    [Fact]
+    public void UpdateHookLivenessState_RacedAgainstSetHookSilenceExpected_LeavesNoStaleEvidenceBehindAReset()
+    {
+        // Corroboration, and worth being honest about which: a stress test can only go red on
+        // a run where the bug is present AND the scheduler happens to land inside the window.
+        // Green here is consistent with the lock working and equally consistent with the race
+        // never occurring, so it proves nothing on its own. The exclusion tests above are the
+        // proof; this is the test that would have caught the old code in the act.
+        //
+        // SetHookSilenceExpected is the resetter rather than NotifyExternalActivity because it
+        // writes no log line: the same loop through NotifyExternalActivity would be 50,000
+        // synchronous file appends instead of 50,000 field writes.
+        const int Iterations = 50_000;
+
+        using var hooks = new HookStateScope();
+        int running = 1;
+        Exception? tickFailure = null;
+
+        try
+        {
+            // Arrange a gap that counts as evidence whatever this machine's real idle time
+            // is. Both ages come off the same tick counter, so anchoring the heartbeat to the
+            // CURRENT GetLastInputInfo reading fixes the gap at ten minutes on a desktop
+            // someone is using and on a CI box that has been idle for hours alike.
+            var systemIdleMs = PhysicalIdle.GetSystemIdleMilliseconds();
+            Assert.False(double.IsInfinity(systemIdleMs), "GetLastInputInfo failed; there is no gap to arrange.");
+            PhysicalIdle.LastHookCallbackMilliseconds =
+                PhysicalIdle.MonotonicMilliseconds - (long)systemIdleMs - 600_000;
+            PhysicalIdle.ConsecutiveHookSilenceTicks = 0;
+
+            // The arrangement has to be non-degenerate or the race below races nothing at
+            // all: prove a tick really does bank evidence from it before starting.
+            PhysicalIdle.SetHookSilenceExpected(false);
+            PhysicalIdle.UpdateHookLivenessState();
+            Assert.Equal(1, PhysicalIdle.ConsecutiveHookSilenceTicks);
+
+            var ticker = new Thread(() =>
+            {
+                try
+                {
+                    while (Volatile.Read(ref running) != 0)
+                    {
+                        PhysicalIdle.UpdateHookLivenessState();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    tickFailure = ex;
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "hook-liveness-tick",
+            };
+
+            ticker.Start();
+
+            int staleIteration = -1;
+            int staleTicks = 0;
+
+            for (var i = 0; i < Iterations; i++)
+            {
+                // Re-arm. With silence no longer expected the ticker starts banking evidence
+                // again, so every iteration gives the reset below something real to lose.
+                PhysicalIdle.SetHookSilenceExpected(false);
+
+                PhysicalIdle.SetHookSilenceExpected(true);
+
+                // The instant that returns, both counters have been zeroed under the lock and
+                // every later tick sees _hookSilenceExpected == true, which can only zero them
+                // again. So a non-zero reading here can only be a verdict the ticker computed
+                // BEFORE the reset and wrote back AFTER it -- the read-modify-write the lock
+                // exists to make impossible.
+                int ticks = PhysicalIdle.ConsecutiveHookSilenceTicks;
+                if (ticks != 0 || PhysicalIdle.DropSuspected)
+                {
+                    staleIteration = i;
+                    staleTicks = ticks;
+                    break;
+                }
+            }
+
+            Volatile.Write(ref running, 0);
+            ticker.Join(UnblockedJoinMs);
+
+            if (tickFailure is not null)
+            {
+                ExceptionDispatchInfo.Capture(tickFailure).Throw();
+            }
+
+            Assert.True(
+                staleIteration < 0,
+                $"A reset at iteration {staleIteration} was overwritten by a tick that had already read the "
+                + $"old state: the counter came back as {staleTicks} instead of 0.");
+        }
+        finally
+        {
+            Volatile.Write(ref running, 0);
+            PhysicalIdle.SetHookSilenceExpected(false);
+        }
+    }
+
     // Arranges the two clock readings the way a tick would see them: the system last saw
     // input `systemIdleMs` ago, and Windows last called a hook callback `callbackAgeMs` ago.
     private static bool Suspect(
@@ -463,4 +760,141 @@ public sealed class HookLivenessTests
             NowMs,
             consecutiveSuspectTicks,
             requiredTicks);
+
+    // Same arrangement as Suspect, advancing the counter instead of reading the verdict. The
+    // defaults are the evidence case, because that is the one most of these tests want.
+    private static int NextTicks(
+        double systemIdleMs,
+        long callbackAgeMs,
+        int currentTicks,
+        int maxTicks = 3) =>
+        PhysicalIdle.NextHookSilenceTicks(
+            systemIdleMs,
+            NowMs - callbackAgeMs,
+            NowMs,
+            currentTicks,
+            maxTicks);
+
+    private static int NextTicks(int currentTicks, int maxTicks = 3) =>
+        NextTicks(EvidenceSystemIdleMs, EvidenceCallbackAgeMs, currentTicks, maxTicks);
+
+    /// <summary>
+    /// The mechanical form of the exclusion proof: take the product's liveness lock on this
+    /// thread, run <paramref name="lockedCall"/> on another, and require that it is still
+    /// running when the window expires and that it finishes once the lock is released.
+    /// </summary>
+    /// <remarks>
+    /// "Still running after <see cref="BlockedProofMs"/>" is weak evidence on its own -- a
+    /// thread that was never scheduled looks identical -- so the worker signals before it
+    /// enters the call and that signal is asserted too. The two callback tests close the rest
+    /// of the gap from the other side: they run product code on a background thread under the
+    /// SAME held lock and require it to finish, so "background threads do not get to run in
+    /// this test process" cannot explain both results at once.
+    /// </remarks>
+    private static void AssertWaitsForTheLivenessLock(string what, Action lockedCall)
+    {
+        using var worker = new BackgroundCall(lockedCall);
+        var livenessLock = PhysicalIdle.HookLivenessLock;
+
+        Monitor.Enter(livenessLock);
+        try
+        {
+            worker.Start();
+
+            Assert.True(
+                worker.WaitUntilEntered(UnblockedJoinMs),
+                $"{what} never reached the product call, so nothing about exclusion was tested.");
+
+            Assert.False(
+                worker.WaitUntilFinished(BlockedProofMs),
+                $"{what} ran to completion while the hook-liveness lock was held, so it is not taking that lock "
+                + "and a reset can still be overwritten by a verdict computed before it.");
+        }
+        finally
+        {
+            Monitor.Exit(livenessLock);
+        }
+
+        Assert.True(
+            worker.WaitUntilFinished(UnblockedJoinMs),
+            $"{what} did not finish within {UnblockedJoinMs} ms of the hook-liveness lock being released.");
+        worker.RethrowFailure();
+    }
+
+    /// <summary>
+    /// The opposite assertion, for the code that must never wait on anything: hold the
+    /// liveness lock and require <paramref name="call"/> to complete anyway.
+    /// </summary>
+    private static void AssertRunsWithoutTheLivenessLock(string what, Action call)
+    {
+        using var worker = new BackgroundCall(call);
+        var livenessLock = PhysicalIdle.HookLivenessLock;
+
+        Monitor.Enter(livenessLock);
+        try
+        {
+            worker.Start();
+
+            Assert.True(
+                worker.WaitUntilFinished(CallbackJoinMs),
+                $"{what} had not returned {CallbackJoinMs} ms into a window where the hook-liveness lock was "
+                + "held by another thread, which means it is waiting on a lock it must never touch.");
+        }
+        finally
+        {
+            Monitor.Exit(livenessLock);
+        }
+
+        worker.RethrowFailure();
+    }
+
+    /// <summary>
+    /// One product call on a background thread, with the two things an exclusion test needs
+    /// from it: a signal that the thread really was scheduled and reached the call, and a
+    /// captured exception, because an assertion that throws on a background thread takes the
+    /// whole test process down instead of failing one test.
+    /// </summary>
+    private sealed class BackgroundCall : IDisposable
+    {
+        private readonly Thread _thread;
+        private readonly ManualResetEventSlim _entered = new(initialState: false);
+        private Exception? _failure;
+
+        internal BackgroundCall(Action body)
+        {
+            _thread = new Thread(() =>
+            {
+                try
+                {
+                    _entered.Set();
+                    body();
+                }
+                catch (Exception ex)
+                {
+                    _failure = ex;
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "hook-liveness-exclusion",
+            };
+        }
+
+        internal void Start() => _thread.Start();
+
+        internal bool WaitUntilEntered(int millisecondsTimeout) => _entered.Wait(millisecondsTimeout);
+
+        internal bool WaitUntilFinished(int millisecondsTimeout) => _thread.Join(millisecondsTimeout);
+
+        /// <summary>Republishes whatever the worker threw, on the thread xunit is watching.</summary>
+        internal void RethrowFailure()
+        {
+            if (_failure is not null)
+            {
+                ExceptionDispatchInfo.Capture(_failure).Throw();
+            }
+        }
+
+        public void Dispose() => _entered.Dispose();
+    }
 }
