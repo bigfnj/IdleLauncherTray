@@ -1,9 +1,14 @@
 // System, System.Collections.Generic, System.Drawing, System.IO and System.Windows.Forms are
 // supplied by ImplicitUsings + UseWindowsForms in the csproj, so they are not repeated here.
-// Only these two need declaring. (IDE0005 is not enabled at build, so the analyzers do not
+// Only these need declaring. (IDE0005 is not enabled at build, so the analyzers do not
 // report the redundant ones.)
+//
+// Microsoft.Win32 is reachable transitively through the Windows Desktop framework reference, so
+// SystemEvents costs no PackageReference.
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using Microsoft.Win32;
 
 namespace IdleLauncherTray;
 
@@ -25,6 +30,14 @@ internal sealed class TrayAppContext : ApplicationContext
     private const int BalloonTipTextMaxLength = 255;
     private const int TransientLaunchRetryCount = 1;
     private const int TransientLaunchRetryDelayMs = 250;
+
+    // Win32 status codes that describe a resource which is momentarily unavailable rather than a
+    // settled answer. See IsRetryableWin32Error.
+    private const int ErrorAccessDenied = 5;
+    private const int ErrorSharingViolation = 32;
+    private const int ErrorLockViolation = 33;
+    private const int ErrorNetnameDeleted = 64;
+    private const int ErrorNoSystemResources = 1450;
 
     private static readonly int[] IdleTimerOptionMinutes = { 1, 3, 5, 10, 15, 20, 30 };
     private static readonly int[] CpuThresholdOptionPercents = { 10, 20, 30, 40, 50 };
@@ -49,12 +62,27 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private Icon? _trayIconObj;
 
+    // Workstation lock state, maintained by OnSessionSwitch.
+    //
+    // `volatile` and nothing heavier is the right tool here: it is written ONLY on the SystemEvents
+    // notification thread and read ONLY on the UI thread, one field, no compound invariant to hold
+    // across the two. There is no read-modify-write to make atomic and no second field that has to
+    // agree with it, so a lock would add a lock-ordering hazard between the UI thread and a thread
+    // we do not own, and buy nothing. What volatile does buy is the guarantee the code actually
+    // needs: the UI thread must not read a cached copy and keep launching into a locked desktop.
+    private volatile bool _workstationLocked;
+
+    // False when the SessionSwitch subscription failed. Lock detection is then off, which the
+    // tooltip reports as a degradation rather than letting the gate quietly not enforce anything.
+    private bool _sessionSwitchSubscribed;
+
     // Menu items we need to update dynamically
     private readonly ToolStripMenuItem _miStartup;
     private readonly ToolStripMenuItem _miSelected;
     private readonly ToolStripMenuItem _miArguments;
     private readonly ToolStripMenuItem _miBlockInjected;
     private readonly ToolStripMenuItem _miLockPcOnAppClose;
+    private readonly ToolStripMenuItem _miAllowLaunchWhileLocked;
     private readonly ToolStripMenuItem _miGamepad;
     private readonly ToolStripMenuItem _miTrayIconEnabled;
 
@@ -77,6 +105,23 @@ internal sealed class TrayAppContext : ApplicationContext
     private bool _targetExistsCachedResult;
     private long _targetExistsCheckedAtMs = long.MinValue;
     private const int TargetExistsCacheTtlMs = 30_000;
+
+    // Last text successfully applied to NotifyIcon.Text, seeded with the value the NotifyIcon is
+    // constructed with so the first genuine status change is the first syscall.
+    private string _lastTrayStatusText = AppPaths.AppName;
+    private bool _trayStatusFailureLogged;
+
+    // Degradation notification state. The reason STRING is remembered rather than a bool: see
+    // UpdateDegradationNotification.
+    private string? _lastDegradationReason;
+    private long _lastDegradationBalloonMs = long.MinValue;
+    private const int DegradationBalloonMinIntervalMs = 5 * 60 * 1000;
+
+    // Consecutive unusable CPU samples. A stuck sampler is invisible otherwise: CpuOk is simply
+    // false forever, which reads as a condition that is merely not met yet. One minute of dead
+    // samples at the 5s cadence is twelve.
+    private int _consecutiveInvalidCpuSamples;
+    private const int MaxConsecutiveInvalidCpuSamples = 12;
 
     // Mutable record (init-style construction via object initializer, then field
     // updates as the evaluation progresses). Record gives us auto-equality and
@@ -103,12 +148,31 @@ internal sealed class TrayAppContext : ApplicationContext
         public bool CpuSampleValid { get; set; }
         public int CpuThresholdPercent { get; set; }
         public bool CpuOk { get; set; }
-        public string ReasonCode { get; set; } = "Unknown";
 
-        public bool Ready => HasTarget && TargetSupported && TargetExists && CooldownOk && InputIdleOk && CpuOk;
+        // Whether the workstation was locked at the moment this evaluation was taken.
+        public bool WorkstationLocked { get; set; }
+
+        // Whether the session state permits launching. Separate from WorkstationLocked because
+        // the user can opt into launching anyway (AppConfig.AllowLaunchWhileLocked), so "locked"
+        // and "blocked" are genuinely different facts and the log has to be able to say which.
+        public bool SessionOk { get; set; } = true;
+
+        public LaunchReasonCode ReasonCode { get; set; } = LaunchReasonCode.Unknown;
+
+        // Ready is computed from the booleans and ignores ReasonCode entirely, which is why
+        // SessionOk has to appear HERE and not only in the labelling cascade below. Adding the
+        // reason code without adding the boolean would have produced an evaluation that says
+        // "WorkstationLocked" and launches anyway.
+        public bool Ready =>
+            HasTarget && TargetSupported && TargetExists && SessionOk && CooldownOk && InputIdleOk && CpuOk;
 
         public string StateKey(bool armed)
         {
+            // NOTE: ReasonCode is an enum, so this binds string.Join(string, params object?[])
+            // rather than the params string?[] overload it used to. The rendered output is
+            // identical because Enum.ToString() yields the member name, which is byte-identical
+            // to the string literal it replaced -- and a test pins the exact string so the next
+            // person to touch this does not have to take that on trust.
             return string.Join(
                 "|",
                 armed ? "armed" : "disarmed",
@@ -116,6 +180,8 @@ internal sealed class TrayAppContext : ApplicationContext
                 HasTarget ? "target" : "no-target",
                 TargetSupported ? "target-supported" : "target-unsupported",
                 TargetExists ? "target-exists" : "target-missing",
+                WorkstationLocked ? "locked" : "unlocked",
+                SessionOk ? "session-ok" : "session-blocked",
                 CooldownOk ? "cooldown-ok" : "cooldown-wait",
                 InputIdleOk ? "idle-ok" : "idle-wait",
                 CpuSampleValid ? "cpu-valid" : "cpu-invalid",
@@ -133,7 +199,7 @@ internal sealed class TrayAppContext : ApplicationContext
                 : "unknown";
 
             return
-                $"state={state}; reason={ReasonCode}; target='{TargetPath}'; targetSupported={TargetSupported}; targetExists={TargetExists}; idle={IdleSeconds}s/{RequiredIdleSeconds}s; cpu={cpuText}/{CpuThresholdPercent}%; cooldownOk={CooldownOk}; cooldownRemaining={CooldownRemainingSeconds.ToString("0.0", CultureInfo.InvariantCulture)}s; armed={armed}.";
+                $"state={state}; reason={ReasonCode}; target='{TargetPath}'; targetSupported={TargetSupported}; targetExists={TargetExists}; workstationLocked={WorkstationLocked}; sessionOk={SessionOk}; idle={IdleSeconds}s/{RequiredIdleSeconds}s; cpu={cpuText}/{CpuThresholdPercent}%; cooldownOk={CooldownOk}; cooldownRemaining={CooldownRemainingSeconds.ToString("0.0", CultureInfo.InvariantCulture)}s; armed={armed}.";
         }
     }
 
@@ -463,6 +529,28 @@ internal sealed class TrayAppContext : ApplicationContext
         };
 
         miOptions.DropDownItems.Add(_miGamepad);
+
+        _miAllowLaunchWhileLocked = new ToolStripMenuItem("Allow launching while the PC is locked")
+        {
+            CheckOnClick = true,
+            Checked = _cfg.AllowLaunchWhileLocked,
+            ToolTipText =
+                "When enabled, the idle trigger may launch the target while the workstation is locked. Off by default, because a target started behind the lock screen is invisible until you sign back in."
+        };
+
+        _miAllowLaunchWhileLocked.Click += (_, _) => RunMenuAction("Toggle 'Allow launching while the PC is locked'", () =>
+        {
+            _cfg.AllowLaunchWhileLocked = _miAllowLaunchWhileLocked.Checked;
+            ConfigManager.Save(_cfg);
+
+            // The readiness snapshot is keyed on the evaluated state, and this toggle changes how
+            // the very same session state evaluates. Without the invalidation the next tick would
+            // compare equal to the pre-toggle key and log nothing at all.
+            InvalidateReadinessSnapshot();
+            Logger.Info($"Allow launching while the PC is locked set to {_cfg.AllowLaunchWhileLocked}.");
+        });
+
+        miOptions.DropDownItems.Add(_miAllowLaunchWhileLocked);
         miOptions.DropDownItems.Add(new ToolStripSeparator());
 
         // Enable/disable custom tray icon (when disabled, we use the EXE icon)
@@ -611,10 +699,16 @@ internal sealed class TrayAppContext : ApplicationContext
                 return;
             }
 
-            if (TryLaunchSelectedApp("manual Run Now", launchedFromIdle: false, showErrorDialog: true, out _, out _))
-            {
-                DisarmAfterLaunch("manual Run Now");
-            }
+            // Run Now deliberately does NOT disarm, and used to. Disarming here switched automatic
+            // launching off until fresh user activity -- so clicking Run Now and then walking away
+            // was the worst possible sequence: when the target exited, InputIdleOk was still true,
+            // the re-arm branch in OnTick never ran, and the launcher stayed dead for the entire
+            // away period, which is exactly the period it exists for.
+            //
+            // Nothing is lost by leaving it armed. A second launch on the same tick is already
+            // blocked by the tracked-process handle and by the 10s cooldown, and the automatic
+            // path keeps its own disarm so a failing target still cannot loop.
+            TryLaunchSelectedApp("manual Run Now", launchedFromIdle: false, showErrorDialog: true, out _, out _, out _);
         });
 
         _menu.Items.Add(miRunNow);
@@ -692,6 +786,24 @@ internal sealed class TrayAppContext : ApplicationContext
         else if (!string.IsNullOrWhiteSpace(_cfg.LastLaunchUtc))
         {
             Logger.Warn($"Could not parse saved LastLaunchUtc value. Value='{_cfg.LastLaunchUtc}'.");
+        }
+
+        // Session-lock detection. Subscribing can throw (a broken SystemEvents window pump, a
+        // session with no desktop), and when it does the app is still perfectly useful -- so this
+        // must NOT fail construction. The flag instead feeds ComposeDegradationReason, which puts
+        // "lock detection off" in the tooltip: the failure of a guard is reported rather than
+        // leaving a guard that silently enforces nothing.
+        try
+        {
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+            _sessionSwitchSubscribed = true;
+            Logger.Info("Subscribed to session switch notifications; automatic launching will be blocked while the workstation is locked.");
+        }
+        catch (Exception ex)
+        {
+            _sessionSwitchSubscribed = false;
+            Logger.Warn(
+                $"Failed to subscribe to session switch notifications. Lock detection is off and the tray tooltip will report the degradation. Error='{ex.Message}'.");
         }
 
         // Monitor loop
@@ -866,6 +978,72 @@ internal sealed class TrayAppContext : ApplicationContext
         return (int)Math.Floor(PhysicalIdle.GetIdleMilliseconds() / 1000.0);
     }
 
+    // RUNS ON THE SystemEvents DEDICATED NOTIFICATION THREAD, NOT THE UI THREAD.
+    //
+    // Everything touched here has to be safe from an arbitrary thread: the volatile bool below,
+    // Logger (a single global lock around a synchronous append) and PhysicalIdle (Interlocked /
+    // volatile state throughout). NO WinForms object may be touched -- _notify, _menu and _timer
+    // all belong to the thread that created them, and the failure mode of getting that wrong is
+    // an intermittent crash on a machine nobody is watching, because it happens at the lock
+    // screen by definition.
+    //
+    // The whole body is wrapped because an exception escaping here does not merely get logged:
+    // Program.cs's AppDomain.UnhandledException handler logs and hides the tray icon, but it
+    // cannot cancel the termination -- the CLR still kills the process. A session switch, which
+    // is a routine event on any machine with a lock timeout, must not be able to do that.
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
+    {
+        try
+        {
+            switch (e.Reason)
+            {
+                // Locked: our low-level hooks no longer see the user's input, so every idle
+                // measurement from here on is "the user has been idle for the whole lock".
+                case SessionSwitchReason.SessionLock:
+                case SessionSwitchReason.ConsoleDisconnect:
+                case SessionSwitchReason.RemoteDisconnect:
+                    _workstationLocked = true;
+                    Logger.Info($"Session became unavailable; automatic launching is now blocked. Reason={e.Reason}.");
+                    break;
+
+                case SessionSwitchReason.SessionUnlock:
+                case SessionSwitchReason.ConsoleConnect:
+                case SessionSwitchReason.RemoteConnect:
+                    // THE ORDER BELOW IS LOAD-BEARING: the idle clock must be reset BEFORE
+                    // _workstationLocked is cleared, never after. The password typed on the secure
+                    // desktop never reaches WH_KEYBOARD_LL, so at this instant the hooks still
+                    // report the entire lock duration as idle time. A tick landing in the gap
+                    // between a cleared flag and a not-yet-reset clock would see "unlocked and
+                    // hours idle" and launch the target one tick after the user signed back in.
+                    // TODO(merge): call PhysicalIdle.NotifyExternalActivity here when feat/hook-drop-detection merges.
+                    _workstationLocked = false;
+                    Logger.Info($"Session became available; automatic launching is allowed again. Reason={e.Reason}.");
+                    break;
+
+                default:
+                    // Deliberately no state change for SessionLogon / SessionLogoff: those fire
+                    // for OTHER sessions as well (fast user switching), so reacting to them would
+                    // let a second user's logon clear a flag that describes OUR session. And
+                    // SessionRemoteControl says nothing about whether input reaches our hooks.
+                    Logger.Info(
+                        $"Session switch ignored because it does not change input availability for this session. Reason={e.Reason}.");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                Logger.Warn($"Failed to handle a session switch notification. Reason={e?.Reason} Error='{ex.Message}'.");
+            }
+            catch
+            {
+                // The logger is the last thing left and it is failing too. Swallowing is the
+                // whole point of this handler: see the note above about process termination.
+            }
+        }
+    }
+
     // Centralised exception handling for tray menu Click handlers. Any handler that
     // mutates settings / writes config / touches the registry / spawns a process
     // should run through this so an unexpected exception logs cleanly and surfaces
@@ -911,6 +1089,16 @@ internal sealed class TrayAppContext : ApplicationContext
 
             if (running)
             {
+                // Tooltip call site 1 of 3. This early return is exactly why there are three: a
+                // single update at the tail of the method would leave the tooltip frozen on the
+                // last pre-launch status for the whole run of the target, which may be hours.
+                var runningDegradation = ComposeDegradationReason();
+                UpdateDegradationNotification(runningDegradation);
+                SetTrayStatusText(TrayStatusText.ForRunningTarget(
+                    AppPaths.AppName,
+                    runningDegradation,
+                    TargetFileNameOrNull(TargetFilePolicy.NormalizePath(_cfg.AppPath))));
+
                 return;
             }
 
@@ -934,15 +1122,19 @@ internal sealed class TrayAppContext : ApplicationContext
                     // silently and leave the launcher armed -- the in-flight launch will disarm
                     // it on success.
                 }
-
-                return;
             }
 
+            // `else if`, not `if`. The Ready branch used to `return` here, which skipped the
+            // re-arm cascade entirely; `else if` skips it identically, so this restructure is
+            // behaviour-preserving. A plain `if` would NOT be: Ready implies InputIdleOk, so the
+            // condition would evaluate false on a ready tick, the `else` below would run, and
+            // _consecutiveNonIdleTicks would be reset on a tick that never used to touch it.
+            //
             // `evaluation.IdleMeasured &&` is load-bearing: without it the three early-return
             // paths (no target / unsupported / missing) satisfy `!InputIdleOk` by never having
             // computed it, so a target on a flaky share re-armed the launcher every other tick
             // while the user was away, and logged that fresh user activity had been observed.
-            if (!_armed && evaluation.IdleMeasured && !evaluation.InputIdleOk)
+            else if (!_armed && evaluation.IdleMeasured && !evaluation.InputIdleOk)
             {
                 // Require at least 2 consecutive non-idle ticks to confirm genuine user activity
                 // before re-arming. This prevents rapid arm/disarm flapping when the user is
@@ -960,11 +1152,162 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 _consecutiveNonIdleTicks = 0;
             }
+
+            // Tooltip call site 2 of 3, reached by every non-running tick -- including the ready
+            // one, whose `return` was removed above precisely so it lands here. `_armed` is read
+            // after the launch attempt on purpose: a tick that just launched is disarmed, and the
+            // tooltip should say so rather than still advertising "Ready to launch".
+            var degradation = ComposeDegradationReason();
+            UpdateDegradationNotification(degradation);
+            SetTrayStatusText(TrayStatusText.ForEvaluation(
+                AppPaths.AppName,
+                degradation,
+                evaluation.ReasonCode,
+                _armed,
+                TargetFileNameOrNull(evaluation.TargetPath),
+                evaluation.IdleSeconds,
+                evaluation.RequiredIdleSeconds,
+                evaluation.CpuPercent,
+                evaluation.CpuThresholdPercent));
         }
         catch (Exception ex)
         {
             Logger.Error("Unhandled exception in monitor tick.", ex);
+
+            // Tooltip call site 3 of 3. A tick that throws is the one failure the user has no
+            // other way to notice: the launcher simply stops launching. Its own try/catch because
+            // we are already inside a catch on the WinForms pump, where an escape becomes an
+            // unhandled UI-thread exception and takes the process down via Program.cs.
+            try
+            {
+                SetTrayStatusText(TrayStatusText.ForTickFailure(AppPaths.AppName));
+            }
+            catch
+            {
+                // The tick has already failed and the tooltip is cosmetic; the original error is
+                // logged above, which is the part that matters.
+            }
         }
+    }
+
+    // Path.GetFileName over a target path, reduced to null when there is nothing worth showing.
+    // The formatter treats null as "no name" and falls back to a generic body, so the tooltip
+    // never renders "Target missing: " with an empty tail.
+    private static string? TargetFileNameOrNull(string targetPath)
+    {
+        try
+        {
+            var fileName = Path.GetFileName(targetPath);
+            return string.IsNullOrWhiteSpace(fileName) ? null : fileName;
+        }
+        catch
+        {
+            // A malformed path must not be able to break the tooltip; the status is still useful
+            // without the file name.
+            return null;
+        }
+    }
+
+    // Applies text to the tray tooltip, skipping the writes that would change nothing.
+    private void SetTrayStatusText(string text)
+    {
+        // Each assignment to NotifyIcon.Text is a Shell_NotifyIcon(NIM_MODIFY) call into the
+        // shell. The status only moves on a state transition, so the early return removes twelve
+        // syscalls a minute that all write the same string.
+        if (string.Equals(_lastTrayStatusText, text, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        try
+        {
+            _notify.Text = text;
+
+            // Latched AFTER the assignment succeeds, never before. Recording a value the shell
+            // rejected would make every later call compare equal and return early -- the tooltip
+            // would freeze at whatever it last displayed, permanently, with no retry path.
+            _lastTrayStatusText = text;
+            _trayStatusFailureLogged = false;
+        }
+        catch (Exception ex)
+        {
+            // At most one warning per failure episode. The tick runs every five seconds, so an
+            // unconditional log here would rotate the log file out from under the real diagnosis.
+            if (!_trayStatusFailureLogged)
+            {
+                _trayStatusFailureLogged = true;
+                Logger.Warn($"Failed to update the tray tooltip text. Text='{text}' Error='{ex.Message}'.");
+            }
+        }
+    }
+
+    // The one reason, if any, that this app is currently running in a degraded state -- ordered
+    // most-dangerous-first, because the tooltip has room for exactly one. "Most dangerous" means
+    // "most changes what the user should expect from the app", not "rarest".
+    private string? ComposeDegradationReason()
+    {
+        // TODO(merge): hook degradation source is added when feat/hook-drop-detection merges.
+
+        if (!_sessionSwitchSubscribed)
+        {
+            // We cannot tell locked from unlocked, so the lock gate below is not enforcing
+            // anything -- and a gate that reports nothing when it stops working is worse than no
+            // gate, because the user believes it is holding.
+            return "lock detection off";
+        }
+
+        if (_consecutiveInvalidCpuSamples >= MaxConsecutiveInvalidCpuSamples)
+        {
+            // CpuOk is false while this lasts, so the launcher never fires. Without this the
+            // tooltip would report "CPU reading unavailable" indefinitely, which reads like a
+            // condition that is about to clear.
+            return "CPU sampling stuck";
+        }
+
+        return null;
+    }
+
+    private void UpdateDegradationNotification(string? reason)
+    {
+        var normalized = string.IsNullOrWhiteSpace(reason) ? null : reason.Trim();
+
+        // Deduped on the REASON STRING and not on an "already degraded" bool. An escalation from
+        // one fault to another is a different problem with a different remedy, and a bool would
+        // swallow it: the user would be told about the first fault and never about the second.
+        if (string.Equals(_lastDegradationReason, normalized, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var previous = _lastDegradationReason;
+        _lastDegradationReason = normalized;
+
+        if (normalized == null)
+        {
+            Logger.Info($"Degraded operation cleared. PreviousReason='{previous}'.");
+            return;
+        }
+
+        Logger.Warn($"Operating in a degraded state. Reason='{normalized}' PreviousReason='{previous ?? "(none)"}'.");
+
+        // Rate-limit the balloon but never the log: a fault that flaps between two reasons passes
+        // the dedupe above on every tick, and a balloon every five seconds is an app the user
+        // uninstalls. The long.MinValue guard is not decoration -- subtracting it from
+        // TickCount64 overflows and would make the first notification of the run appear
+        // rate-limited.
+        var nowMs = Environment.TickCount64;
+        if (_lastDegradationBalloonMs != long.MinValue
+            && nowMs - _lastDegradationBalloonMs < DegradationBalloonMinIntervalMs)
+        {
+            return;
+        }
+
+        _lastDegradationBalloonMs = nowMs;
+
+        ShowTrayNotification(
+            $"{AppPaths.AppName} is running degraded",
+            $"{normalized}. Automatic launching may not behave as configured. See the log for details.",
+            ToolTipIcon.Warning);
     }
 
     private LaunchEvaluation EvaluateLaunchReadiness()
@@ -1004,23 +1347,43 @@ internal sealed class TrayAppContext : ApplicationContext
         evaluation.InputIdleOk = evaluation.IdleSeconds >= evaluation.RequiredIdleSeconds;
         evaluation.CpuOk = evaluation.CpuSampleValid && evaluation.CpuPercent <= evaluation.CpuThresholdPercent;
 
+        // Counted here, beside the sampler that produces the samples, so the counter cannot drift
+        // away from its source. Saturating at the threshold rather than incrementing forever: the
+        // only question ever asked of it is ">= MaxConsecutiveInvalidCpuSamples", and a counter
+        // that stops climbing cannot overflow into a negative that would silently clear the fault.
+        if (evaluation.CpuSampleValid)
+        {
+            _consecutiveInvalidCpuSamples = 0;
+        }
+        else if (_consecutiveInvalidCpuSamples < MaxConsecutiveInvalidCpuSamples)
+        {
+            _consecutiveInvalidCpuSamples++;
+        }
+
+        // ONE volatile read, taken into the evaluation and then re-read from there. Reading
+        // _workstationLocked twice would let a lock or unlock land between the two reads and
+        // produce an evaluation that describes no state the machine was ever in -- "locked" in
+        // the log line, "session ok" in the decision, or the reverse.
+        evaluation.WorkstationLocked = _workstationLocked;
+        evaluation.SessionOk = !evaluation.WorkstationLocked || _cfg.AllowLaunchWhileLocked;
+
         if (!evaluation.HasTarget)
         {
-            evaluation.ReasonCode = "NoTargetConfigured";
+            evaluation.ReasonCode = LaunchReasonCode.NoTargetConfigured;
             return evaluation;
         }
 
         evaluation.TargetSupported = TargetFilePolicy.IsSupportedTarget(targetPath);
         if (!evaluation.TargetSupported)
         {
-            evaluation.ReasonCode = "SelectedTargetUnsupported";
+            evaluation.ReasonCode = LaunchReasonCode.SelectedTargetUnsupported;
             return evaluation;
         }
 
         evaluation.TargetExists = TargetExistsCached(targetPath);
         if (!evaluation.TargetExists)
         {
-            evaluation.ReasonCode = "SelectedTargetMissing";
+            evaluation.ReasonCode = LaunchReasonCode.SelectedTargetMissing;
             return evaluation;
         }
 
@@ -1050,25 +1413,39 @@ internal sealed class TrayAppContext : ApplicationContext
             }
         }
 
-        if (!evaluation.CooldownOk)
+        // The lock label goes HERE -- first in this cascade -- and in neither of the two places it
+        // might look like it belongs.
+        //
+        // Not at the top of the method: that would report "Locked" for a target that does not
+        // exist, and the user would wait out a lock state that was never the problem while the
+        // real fault stayed invisible for as long as the machine stayed locked.
+        //
+        // Not before the cooldown block above either: that block self-heals a _lastLaunchUtc that
+        // has moved into the future, and that value is PERSISTED to config.json. Skipping the
+        // repair while locked would let a clock jump strand the cooldown across restarts.
+        if (!evaluation.SessionOk)
         {
-            evaluation.ReasonCode = "LaunchCooldownActive";
+            evaluation.ReasonCode = LaunchReasonCode.WorkstationLocked;
+        }
+        else if (!evaluation.CooldownOk)
+        {
+            evaluation.ReasonCode = LaunchReasonCode.LaunchCooldownActive;
         }
         else if (!evaluation.InputIdleOk)
         {
-            evaluation.ReasonCode = "WaitingForInputIdle";
+            evaluation.ReasonCode = LaunchReasonCode.WaitingForInputIdle;
         }
         else if (!evaluation.CpuSampleValid)
         {
-            evaluation.ReasonCode = "CpuSampleUnavailable";
+            evaluation.ReasonCode = LaunchReasonCode.CpuSampleUnavailable;
         }
         else if (!evaluation.CpuOk)
         {
-            evaluation.ReasonCode = "CpuAboveThreshold";
+            evaluation.ReasonCode = LaunchReasonCode.CpuAboveThreshold;
         }
         else
         {
-            evaluation.ReasonCode = "Ready";
+            evaluation.ReasonCode = LaunchReasonCode.Ready;
         }
 
         return evaluation;
@@ -1119,19 +1496,18 @@ internal sealed class TrayAppContext : ApplicationContext
     // scanner briefly holding the target's file handle, say -- should not disarm the launcher and
     // force the user to wiggle the mouse.
     //
-    // NOTE the honest limitation: TryLaunchSelectedApp returns false for EVERY failure, including
-    // permanent ones (no target, unsupported type, file not found). This wrapper therefore retries
-    // those too and pays one extra UI-thread sleep for them. The earlier comment here claimed the
-    // retry fired "only on genuinely transient errors (IO / unauthorized access)"; no such
-    // classification existed then or now. Classifying the exception inside the launch path is
-    // recorded in BACKLOG.md.
+    // TryLaunchSelectedApp used to return a bare false for EVERY failure, so this wrapper retried
+    // the permanent ones too -- "no target", "unsupported type", "file not found" -- and paid a
+    // 250ms Thread.Sleep on the UI thread for each, which is a visibly frozen tray menu in
+    // exchange for an outcome that could not change. It now reports whether the failure was
+    // transient (see IsTransientLaunchFailure) and only those are retried.
     //
-    // What IS now distinguished is the re-entrancy rejection, via alreadyInProgress -- see below.
+    // The re-entrancy rejection is distinguished separately, via alreadyInProgress -- see below.
     private bool TryLaunchWithTransientRetry(string trigger, out string failureMessage, out bool alreadyInProgress)
     {
         for (var attempt = 0; ; attempt++)
         {
-            if (TryLaunchSelectedApp(trigger, launchedFromIdle: true, showErrorDialog: false, out failureMessage, out alreadyInProgress))
+            if (TryLaunchSelectedApp(trigger, launchedFromIdle: true, showErrorDialog: false, out failureMessage, out alreadyInProgress, out var failureIsTransient))
             {
                 return true;
             }
@@ -1141,6 +1517,11 @@ internal sealed class TrayAppContext : ApplicationContext
             // failure: doing so raised a false "Automatic launch failed" balloon and disarmed the
             // launcher for a launch that was actually in flight and about to succeed.
             if (alreadyInProgress)
+            {
+                return false;
+            }
+
+            if (!failureIsTransient)
             {
                 return false;
             }
@@ -1155,10 +1536,19 @@ internal sealed class TrayAppContext : ApplicationContext
         }
     }
 
-    private bool TryLaunchSelectedApp(string trigger, bool launchedFromIdle, bool showErrorDialog, out string failureMessage, out bool alreadyInProgress)
+    // failureIsTransient answers the one question the retry wrapper needs: could a second attempt
+    // plausibly succeed? It stays false on every path that fails for a settled reason, so those
+    // failures cost no sleep and no second Process.Start.
+    private bool TryLaunchSelectedApp(string trigger, bool launchedFromIdle, bool showErrorDialog, out string failureMessage, out bool alreadyInProgress, out bool failureIsTransient)
     {
         failureMessage = string.Empty;
         alreadyInProgress = false;
+
+        // Default false: only the exception path below can promote a failure to transient. Every
+        // early return here -- no target, unsupported type, file missing -- is permanent by
+        // construction, and leaving the default in place is what makes that true without four
+        // separate assignments that a later edit could forget.
+        failureIsTransient = false;
 
         // Guard against concurrent launches (e.g., rapid Run Now clicks or overlapping idle triggers).
         if (Interlocked.Exchange(ref _launchingSerialized, 1) != 0)
@@ -1311,7 +1701,8 @@ internal sealed class TrayAppContext : ApplicationContext
         catch (Exception ex)
         {
             failureMessage = ex.Message;
-            Logger.Error($"Failed to launch target via {trigger}. Path='{path}'.", ex);
+            failureIsTransient = IsTransientLaunchFailure(ex);
+            Logger.Error($"Failed to launch target via {trigger}. Path='{path}' Transient={failureIsTransient}.", ex);
 
             if (showErrorDialog)
             {
@@ -1328,6 +1719,46 @@ internal sealed class TrayAppContext : ApplicationContext
         {
             Interlocked.Exchange(ref _launchingSerialized, 0);
         }
+    }
+
+    // Which launch failures are worth a second attempt. The retry costs a Thread.Sleep on the UI
+    // thread with the message pump held, so it has to be spent only where a retry can plausibly
+    // win: a file handle an antivirus scanner is holding for a moment, a share that blinked, an
+    // ACL check that lost a race. "No such file" and "not a valid application" will answer the
+    // same way every time.
+    private static bool IsTransientLaunchFailure(Exception ex)
+    {
+        return ex switch
+        {
+            // These derive from IOException and are permanent, so they MUST be matched before the
+            // IOException arm below, which would otherwise swallow them. Verified by breaking it:
+            // swapping the two arms is a compile ERROR (CS8510, unreachable pattern), so this
+            // particular ordering cannot regress silently.
+            FileNotFoundException or DirectoryNotFoundException => false,
+            IOException => true,
+            UnauthorizedAccessException => true,
+            Win32Exception win32 => IsRetryableWin32Error(win32.NativeErrorCode),
+            _ => false
+        };
+    }
+
+    // Process.Start with UseShellExecute reports shell failures as Win32Exception, so the native
+    // code is the only thing that separates "busy" from "no".
+    //
+    // Retried: ACCESS_DENIED (5, which the shell also returns for a transient ACL/AV block),
+    // SHARING_VIOLATION (32), LOCK_VIOLATION (33), NETNAME_DELETED (64, a share that dropped) and
+    // NO_SYSTEM_RESOURCES (1450).
+    //
+    // NOT retried, and deliberately absent: FILE_NOT_FOUND (2) and BAD_EXE_FORMAT (193) are
+    // settled answers, and CANCELLED (1223) means the user dismissed the elevation prompt --
+    // retrying that one re-prompts a person who just said no.
+    private static bool IsRetryableWin32Error(int nativeErrorCode)
+    {
+        return nativeErrorCode is ErrorAccessDenied
+            or ErrorSharingViolation
+            or ErrorLockViolation
+            or ErrorNetnameDeleted
+            or ErrorNoSystemResources;
     }
 
     private void DisarmAfterLaunch(string trigger)
@@ -1390,20 +1821,12 @@ internal sealed class TrayAppContext : ApplicationContext
         return $"{fileName} could not be launched automatically. IdleLauncherTray will wait for new user activity before trying again. See the log for details.";
     }
 
-    private static string TruncateForBalloonTip(string value, int maxLength)
-    {
-        if (string.IsNullOrEmpty(value) || value.Length <= maxLength)
-        {
-            return value;
-        }
-
-        if (maxLength <= 1)
-        {
-            return value[..maxLength];
-        }
-
-        return value[..(maxLength - 1)] + "…";
-    }
+    // Delegates to TrayStatusText.Clamp rather than keeping a second copy of the same algorithm.
+    // The copy that used to live here had the same latent flaw the tooltip one was written to
+    // avoid: `value[..(maxLength - 1)]` can cut between the halves of a surrogate pair, leaving an
+    // unpaired code unit in a balloon title. One truncator, fixed once.
+    private static string TruncateForBalloonTip(string value, int maxLength) =>
+        TrayStatusText.Clamp(value, maxLength);
 
     // allowWorkstationLock exists because discovering an exit here has a SIDE EFFECT: it can
     // lock the workstation. That is right from the timer tick, and wrong from a menu handler --
@@ -1627,7 +2050,7 @@ internal sealed class TrayAppContext : ApplicationContext
     private void LogConfigurationSummary()
     {
         Logger.Info(
-            $"Configuration loaded. PortableMode=true AppPath='{_cfg.AppPath}' IdleMinutes={_cfg.IdleMinutes} CpuThresholdPercent={_cfg.CpuThresholdPercent} RunAtStartup={_cfg.RunAtStartup} BlockInjectedWhileRunning={_cfg.BlockInjectedWhileRunning} LockPcOnAppClose={_cfg.LockPcOnAppClose} GamepadCountsAsActivity={_cfg.GamepadCountsAsActivity} UseSystemIdleFailSafe={_cfg.UseSystemIdleFailSafe} SystemIdleFailSafeWindowMs={_cfg.SystemIdleFailSafeWindowMs} TrayIconEnabled={_cfg.TrayIconEnabled} TrayIconPath='{_cfg.TrayIconPath}'.");
+            $"Configuration loaded. PortableMode=true AppPath='{_cfg.AppPath}' IdleMinutes={_cfg.IdleMinutes} CpuThresholdPercent={_cfg.CpuThresholdPercent} RunAtStartup={_cfg.RunAtStartup} BlockInjectedWhileRunning={_cfg.BlockInjectedWhileRunning} LockPcOnAppClose={_cfg.LockPcOnAppClose} AllowLaunchWhileLocked={_cfg.AllowLaunchWhileLocked} GamepadCountsAsActivity={_cfg.GamepadCountsAsActivity} UseSystemIdleFailSafe={_cfg.UseSystemIdleFailSafe} SystemIdleFailSafeWindowMs={_cfg.SystemIdleFailSafeWindowMs} TrayIconEnabled={_cfg.TrayIconEnabled} TrayIconPath='{_cfg.TrayIconPath}'.");
     }
 
     private static void LogHookStatus()
@@ -1706,6 +2129,13 @@ internal sealed class TrayAppContext : ApplicationContext
         _shutDown = true;
 
         Logger.Info("Shutting down tray application.");
+
+        // FIRST, and mandatory rather than tidy. SystemEvents.SessionSwitch is a STATIC event, so
+        // the subscription is a GC root: miss this and the whole TrayAppContext stays alive for
+        // the life of the process, and with it _notify, _menu, _cfg and the tracked Process
+        // handle. That is a real leak, and it also means a torn-down instance keeps waking on
+        // every lock and unlock.
+        try { SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { /* ignore */ }
 
         try { _timer.Stop(); } catch { /* ignore */ }
         try { _timer.Dispose(); } catch { /* ignore */ }

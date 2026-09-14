@@ -25,6 +25,19 @@ internal sealed class AppConfig
     // When enabled, Windows is locked after an idle-triggered tracked app exits.
     public bool LockPcOnAppClose { get; set; }
 
+    // When enabled, the idle trigger may launch while the workstation is locked. Off by default:
+    // a target started behind the lock screen is invisible until the user signs back in, and the
+    // password they type on the secure desktop never reaches the low-level hooks, so the launcher
+    // cannot tell "asleep at the desk" from "typing a password" while locked.
+    //
+    // Deliberately spelled "Allow..." rather than "BlockLaunchWhileLocked = true". Here the safe
+    // value IS default(bool), so it survives an absent key on upgrade, a bare `new AppConfig()`
+    // and any path that does not run a property initialiser. The inverted spelling would depend
+    // on that initialiser for its safety, and the moment a hand-edited `null` reaches this
+    // property Deserialize throws — and ConfigManager.Load's catch then discards EVERY setting in
+    // the file, quietly taking the protection with it.
+    public bool AllowLaunchWhileLocked { get; set; }
+
     // Count XInput gamepad activity as user activity
     public bool GamepadCountsAsActivity { get; set; } = true;
 

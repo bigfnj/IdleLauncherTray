@@ -42,14 +42,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **StartupManager.cs**: Registry read/write for startup entry management
 - **WorkstationLock.cs**: Windows API wrapper for workstation locking
 - **TargetFilePolicy.cs**: Validates supported file types and path expansion
+- **TrayStatusText.cs**: Pure formatter for the tray tooltip. No statics, no WinForms, primitives
+  only, hard 63-character cap
+- **LaunchReasonCode.cs**: The closed set of reasons the launcher will or will not fire, so that
+  "every rendered status fits" can be proved by enumeration rather than by a list someone maintains
 - **DeletionHelper.cs**: Deferred cleanup execution (called from command-line args) for safe uninstall
 - **TextPrompt.cs**: Simple dialog form for user text input (used in menu interactions)
 - **AppPaths.cs**: Centralized path constants and environment-variable expansion utilities
 
 ### Launch Readiness State Machine
 
-The polling loop in `TrayAppContext` evaluates a `LaunchEvaluation` struct containing:
+The polling loop in `TrayAppContext` evaluates a `LaunchEvaluation` record containing:
 - Target existence and support status
+- Session availability (locked workstations do not launch unless `AllowLaunchWhileLocked` is set)
 - Input idle time vs. required threshold
 - CPU usage vs. threshold
 - Cooldown timer (10-second minimum between launches)
@@ -59,6 +64,36 @@ The state transitions to "ready-to-launch" only when all conditions pass. On suc
 - Process handle is tracked for exit monitoring
 - Workstation lock is applied if enabled (only for idle launches, not manual "Run Now")
 - Re-arming happens after fresh user activity
+
+`LaunchEvaluation.Ready` is computed from the booleans alone and never reads `ReasonCode`. A new
+gate therefore has to add a boolean to `Ready` as well as a reason code, or it will label the
+blocked state in the log and launch anyway.
+
+### Session Lock Gating
+
+`SystemEvents.SessionSwitch` maintains a `volatile bool`. The handler runs on the SystemEvents
+notification thread, so it touches nothing owned by the UI thread; the flag is read once per tick
+into the evaluation.
+
+Two ordering rules are load-bearing. On unlock the idle clock is reset *before* the flag is
+cleared, because the password typed on the secure desktop never reaches `WH_KEYBOARD_LL` and a
+tick landing in the gap would see "unlocked and fully idle". And the lock label is applied as the
+first arm of the reason cascade rather than at the top of the evaluation, so a missing target is
+still diagnosed as a missing target while the machine happens to be locked.
+
+The subscription is to a *static* event, so `ShutdownForExit` unsubscribes first: a missed
+unsubscribe roots the whole `TrayAppContext` for the life of the process.
+
+### Tray Status Text
+
+`TrayStatusText` is a pure formatter: primitives in, one line of at most 63 characters out. It
+reads no static state and touches no WinForms object, which is what allows the length guarantee to
+be proved exhaustively over `Enum.GetValues(typeof(LaunchReasonCode))` in the test suite — the
+reason codes are an enum rather than strings for exactly that reason.
+
+`OnTick` updates the tooltip from three places, not one: the running-target early return, the tail
+of the normal path, and the `catch`. A single tail call would freeze the tooltip for the whole run
+of a launched target and would say nothing at all when a tick throws.
 
 ## Build & Development
 
@@ -111,6 +146,7 @@ This produces a single `IdleLauncherTray.exe` targeting `win-x64` (requires .NET
 - **Startup mode**: Enabled/disabled via tray menu (writes to Windows registry)
 - **Block injected input**: Optional checkbox in tray menu
 - **Lock on close**: Optional checkbox in tray menu
+- **Allow launching while the PC is locked**: Optional checkbox in tray menu, off by default
 - **Gamepad activity**: Optional checkbox in tray menu
 - **Custom tray icon**: Optional custom .ico file in `%APPDATA%\IdleLauncherTray\`
 

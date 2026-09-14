@@ -26,6 +26,10 @@ public sealed class ConfigManagerTests
         Assert.False(config.RunAtStartup);
         Assert.False(config.BlockInjectedWhileRunning);
         Assert.False(config.LockPcOnAppClose);
+
+        // The safe side of the lock gate. False means "do not launch while the PC is locked", and
+        // it has to be the default(bool) rather than something a property initialiser supplies.
+        Assert.False(config.AllowLaunchWhileLocked);
         Assert.True(config.GamepadCountsAsActivity);
         Assert.True(config.UseSystemIdleFailSafe);
         Assert.Equal(ConfigProxy.MinimumSystemIdleFailSafeWindowMs, config.SystemIdleFailSafeWindowMs);
@@ -58,6 +62,7 @@ public sealed class ConfigManagerTests
             RunAtStartup = true,
             BlockInjectedWhileRunning = true,
             LockPcOnAppClose = true,
+            AllowLaunchWhileLocked = true,
             GamepadCountsAsActivity = false,
             UseSystemIdleFailSafe = false,
             SystemIdleFailSafeWindowMs = 9000,
@@ -77,6 +82,7 @@ public sealed class ConfigManagerTests
         Assert.True(loaded.RunAtStartup);
         Assert.True(loaded.BlockInjectedWhileRunning);
         Assert.True(loaded.LockPcOnAppClose);
+        Assert.True(loaded.AllowLaunchWhileLocked);
         Assert.False(loaded.GamepadCountsAsActivity);
         Assert.False(loaded.UseSystemIdleFailSafe);
         Assert.Equal(9000, loaded.SystemIdleFailSafeWindowMs);
@@ -295,6 +301,35 @@ public sealed class ConfigManagerTests
 
         Assert.Equal(12, config.IdleMinutes);
         Assert.True(config.RunAtStartup);
+    }
+
+    [Fact]
+    public void Load_WithTheLockKeyAbsent_DefaultsToNotLaunchingWhileLocked()
+    {
+        // The upgrade path, and the reason the setting is spelled "Allow..." rather than
+        // "Block...". Every config.json written before this version is missing the key entirely,
+        // so the default has to be the safe answer without any migration step -- and IdleMinutes
+        // pins that the file really was read, since a swallowed parse failure would hand back
+        // defaults whose AllowLaunchWhileLocked is false too.
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile("{ \"IdleMinutes\": 9, \"LockPcOnAppClose\": true }");
+
+        var config = ConfigManager.Load();
+
+        Assert.Equal(9, config.IdleMinutes);
+        Assert.True(config.LockPcOnAppClose);
+        Assert.False(config.AllowLaunchWhileLocked);
+    }
+
+    [Theory]
+    [InlineData("true", true)]
+    [InlineData("false", false)]
+    public void Load_ReadsTheStoredLockSetting(string storedJson, bool expected)
+    {
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile($"{{ \"AllowLaunchWhileLocked\": {storedJson} }}");
+
+        Assert.Equal(expected, ConfigManager.Load().AllowLaunchWhileLocked);
     }
 
     [Fact]

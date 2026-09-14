@@ -35,6 +35,11 @@ These require a Windows desktop session and user interaction:
 - Enable **Block injected input while running** with a reliably tracked long-running target; confirm synthetic input is blocked while the tracked process is running and restored after it exits.
 - Enable **Lock PC on App Close** with an idle-triggered long-running target; confirm Windows locks only after the tracked idle-launched process exits.
 - Confirm **Run Now** launches do not trigger lock-on-close.
+- Run **Run Now**, let the target exit without touching the keyboard, then wait out the idle timer; confirm the automatic launch still fires. Run Now must not disarm the launcher.
+- Hover the tray icon over several states and confirm the tooltip tracks them: `IdleLauncherTray: Idle 0:15/5:00` while counting up, `IdleLauncherTray: Running <name>` while a target is tracked, `IdleLauncherTray: Target missing: <name>` after deleting the selected target, `IdleLauncherTray: Disarmed until you use the PC` after a failed automatic launch.
+- With **Allow launching while the PC is locked** OFF, lock the workstation (Win+L) and wait past the idle threshold; confirm nothing launches and the log records `reason=WorkstationLocked` with `sessionOk=False`. Unlock and confirm the launcher does **not** fire on the first tick after sign-in.
+- Turn **Allow launching while the PC is locked** ON, repeat the lock test, and confirm the target does launch.
+- Confirm the log records both halves of the session subscription: `Subscribed to session switch notifications` at startup and a `Session became unavailable` / `Session became available` pair per lock cycle.
 - Toggle **Run at startup** on and off; confirm the HKCU Run entry points to the current portable executable path and is removed when disabled.
 - Use **Uninstall (remove settings + startup)**; confirm `%APPDATA%\IdleLauncherTray` settings are removed, startup registration is removed, and the portable executable remains in place.
 
