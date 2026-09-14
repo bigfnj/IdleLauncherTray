@@ -202,6 +202,79 @@ public static class PhysicalIdle
     // reads/writes via Interlocked.
     private static long _lastPhysicalInputMilliseconds = GetMonotonicMilliseconds();
 
+    // ------------------------------------------------------------------------
+    // Hook liveness: detecting a hook Windows dropped without telling us
+    // ------------------------------------------------------------------------
+    //
+    // Windows silently uninstalls a WH_KEYBOARD_LL / WH_MOUSE_LL hook whose callback
+    // overruns LowLevelHooksTimeout (300 ms by default). It does NOT null our HHOOK and it
+    // raises nothing: SetWindowsHookEx still reports success, _kbHook is still non-zero,
+    // KeyboardHookInstalled still answers true, and the callback simply never runs again.
+    // EnsureHooksStarted only reinstalls a hook whose handle is NULL, so its 30 s retry can
+    // never see this failure. Left undetected the app measures a FULL idle machine forever
+    // and launches into a user who is sitting right there -- silently, which is the worst
+    // shape a bug can take in a tray app nobody is watching.
+    //
+    // What follows is DETECTION AND REPORTING ONLY. It never unhooks and never reinstalls:
+    // the likely cause is a callback that already overran once, and tearing the hook down
+    // and back up from the tick would turn a measurement fault into an input fault for
+    // every application on the desktop. It reports; GetIdleMilliseconds stops trusting the
+    // dead hook and falls back to GetLastInputInfo, which is strictly more conservative.
+    //
+    // Monotonic timestamp of the last time WINDOWS CALLED US, whatever it called us about.
+    // It is deliberately NOT "the last time a human did something": it is written for
+    // injected, suppressed, ScrollLock-filtered and nCode < 0 callbacks alike, because the
+    // question it answers is "is this hook still wired up", not "was that a real user".
+    // Gating it on physical input would report a perfectly healthy hook as dead whenever
+    // the only input on the machine is an anti-idle tool hammering ScrollLock through
+    // SendInput -- which keeps GetLastInputInfo fresh, produces nothing but INJECTED
+    // events, and is precisely the case this whole file exists to defeat.
+    //
+    // Written with a single Interlocked.Exchange from both hook callbacks (they run on the
+    // UI thread and block all system input until they return, so nothing heavier belongs
+    // there) and read from the tick. 64-bit, so the interlocked write is also what makes
+    // the read safe on a 32-bit runtime.
+    private static long _lastHookCallbackMilliseconds = GetMonotonicMilliseconds();
+
+    // How far behind the system's own idle clock the heartbeat has to fall before a tick
+    // counts as evidence. Both readings come from the same tick counter and are taken one
+    // after the other, so scheduling jitter moves them together and cannot manufacture a
+    // gap -- only input that Windows saw and we did not can. The margin is here for the one
+    // benign source of invisible input: the secure desktop (lock screen, UAC prompt), whose
+    // keystrokes update this session's GetLastInputInfo but never reach a hook installed on
+    // the default desktop.
+    private const long HookSilenceGraceMs = 10000;
+
+    // Consecutive ticks of evidence required before the state flips. The tray ticks every
+    // 5 s, so this is ~15 s of sustained disagreement: fast against idle thresholds that are
+    // measured in minutes, and long enough that one unlock cannot trip it on its own.
+    private const int HookSilenceTicksRequired = 3;
+
+    // Advanced only from the tick (TryRepairHooksIfNeeded), which is the only periodic entry
+    // point into this class. Every other writer only ever RESETS it to zero, so the worst a
+    // lost update can do is delay detection by one tick -- it can never fabricate one. The
+    // interlocked access is for visibility to readers on other threads, not for exclusion.
+    private static int _consecutiveHookSilenceTicks;
+
+    // 0/1 latch published by the tick and read by GetIdleMilliseconds (called from the tray
+    // tick and, through the launch path, other threads) and by GetHookDegradationReason.
+    // An int rather than a bool so the write can be an Interlocked.Exchange that pairs with
+    // a Volatile.Read.
+    private static int _hookDropSuspected;
+
+    // The reason string last handed to the log, so an episode is announced once instead of
+    // every 5 s. Only ever touched from the tick, which is single-threaded with itself.
+    private static string? _loggedDegradationReason;
+
+    // Plain literals, never interpolated. The tray prefixes these with
+    // "IdleLauncherTray: DEGRADED - " (29 characters) and drops the result into a NotifyIcon
+    // tooltip, which Windows truncates at 63. Keeping them literal is what makes that budget
+    // checkable at compile time and in a test instead of at runtime on a user's machine.
+    private const string ReasonBothHooksMissing = "input hooks not installed";
+    private const string ReasonKeyboardHookMissing = "keyboard hook not installed";
+    private const string ReasonMouseHookMissing = "mouse hook not installed";
+    private const string ReasonHooksStoppedFiring = "input hooks stopped firing";
+
     // VK code and timestamp of the last injected keystroke, packed into one 64-bit slot:
     // vkCode in the high 32 bits, the low 32 bits of the monotonic clock in the low 32.
     // These used to be two fields written by two separate Interlocked.Exchange calls and
@@ -309,6 +382,32 @@ public static class PhysicalIdle
     private static long GetMonotonicMilliseconds()
     {
         return Environment.TickCount64;
+    }
+
+    // Advance-only publish for a monotonic timestamp field.
+    //
+    // A plain Interlocked.Exchange is wrong for any caller that is not itself on the input
+    // path: a hook callback or the gamepad poll can be publishing a NEWER timestamp on
+    // another thread at this instant, and clobbering it would move the idle clock BACKWARDS
+    // and hand the user back idle time they never accrued. The loop terminates immediately
+    // in the only contended case that exists here, because a competing writer always leaves
+    // a larger value and the next read exits at the comparison. Never called from a hook
+    // callback -- those use a bare Exchange, which is one instruction and cannot spin.
+    private static void AdvanceMonotonicTimestamp(ref long field, long candidateMs)
+    {
+        while (true)
+        {
+            var currentMs = Interlocked.Read(ref field);
+            if (currentMs >= candidateMs)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref field, candidateMs, currentMs) == currentMs)
+            {
+                return;
+            }
+        }
     }
 
     private static double GetSystemIdleMilliseconds()
@@ -547,6 +646,12 @@ public static class PhysicalIdle
     {
         DrainDeferredHookLogs();
         EnsureHooksStarted(forceImmediateRetry: false);
+
+        // Ordered after the reinstall attempt so a hook installed on this very tick starts
+        // its episode with a fresh heartbeat instead of being judged on the silence that
+        // preceded it. This call detects and reports only: repair still belongs to
+        // EnsureHooksStarted above, and that still only fires on a NULL handle.
+        UpdateHookLivenessState();
     }
 
     // Emits whatever the hook callbacks staged instead of logging inline. This is called
@@ -572,6 +677,216 @@ public static class PhysicalIdle
         {
             Logger.Warn($"Injected input suppression auto-released after {InjectedSuppressionMaxDurationMs / 1000} seconds and injected input is being passed through again. This safety net exists so a user whose only input path is injected (On-Screen Keyboard, eye control, AutoHotkey, Mouse Without Borders) cannot be locked out of the desktop. Suppression re-arms the next time it is switched off and back on.");
         }
+    }
+
+    /// <summary>
+    /// The silent-drop rule, as a pure function of its parameters: no static reads, no
+    /// clock of its own, no P/Invoke. That is deliberate -- it is the whole decision, and it
+    /// can be exercised without installing a global hook or owning a message pump.
+    /// </summary>
+    /// <param name="systemIdleMs">
+    /// GetLastInputInfo's answer, or <see cref="double.PositiveInfinity"/> when that call
+    /// failed.
+    /// </param>
+    /// <param name="lastCallbackMs">The heartbeat: when Windows last called either callback.</param>
+    /// <param name="nowMs">The monotonic clock, sampled once by the caller for both readings.</param>
+    /// <param name="consecutiveSuspectTicks">
+    /// How many consecutive ticks have produced evidence, INCLUDING this one. The caller
+    /// owns the counter; this function owns what counts as evidence.
+    /// </param>
+    /// <param name="requiredTicks">
+    /// How many of those ticks are needed. Zero or negative is treated as one: the counter
+    /// is only ever advanced by a tick that produced evidence, so "no ticks required" must
+    /// still mean "one tick of evidence", never "no evidence at all".
+    /// </param>
+    internal static bool IsHookDropSuspected(
+        double systemIdleMs,
+        long lastCallbackMs,
+        long nowMs,
+        int consecutiveSuspectTicks,
+        int requiredTicks)
+    {
+        if (!HasHookSilenceEvidence(systemIdleMs, lastCallbackMs, nowMs))
+        {
+            return false;
+        }
+
+        var required = requiredTicks < 1 ? 1 : requiredTicks;
+        return consecutiveSuspectTicks >= required;
+    }
+
+    // One tick's worth of evidence that a hook stopped firing.
+    //
+    // GetLastInputInfo is the cross-check, and the asymmetry is what makes it one: when our
+    // hook is dropped the input still happens and Windows still records it -- it just stops
+    // reaching us. So the evidence is a DISAGREEMENT between the two clocks:
+    //
+    //     gap = (nowMs - lastCallbackMs) - systemIdleMs
+    //
+    // A user who is genuinely away moves both clocks at the same rate, so the gap sits at
+    // ~0 however many hours pass. That is the property that keeps an idle user from being
+    // reported as a dropped hook, and it is the one that must never regress: reporting a
+    // drop on an idle machine would pin the idle clock exactly the way the v2.5.0 repair
+    // bug did.
+    //
+    // A dropped hook freezes lastCallbackMs while systemIdleMs keeps resetting, so the gap
+    // grows with every keystroke -- and then STAYS where it is once the user stops, which is
+    // deliberate. The evidence that we missed input does not expire when the input does; if
+    // it did, the app would go back to trusting a dead hook at exactly the moment the
+    // machine looks idle, which is the moment it decides to launch. The gap is cleared by a
+    // callback that actually fires, by a hook being installed, or by NotifyExternalActivity.
+    private static bool HasHookSilenceEvidence(double systemIdleMs, long lastCallbackMs, long nowMs)
+    {
+        // An unavailable cross-check is not evidence of failure. GetSystemIdleMilliseconds
+        // returns PositiveInfinity when GetLastInputInfo fails; NaN cannot come from there,
+        // but every comparison below would silently answer false for it, so reject it where
+        // the reason is visible rather than by accident.
+        if (double.IsNaN(systemIdleMs) || double.IsInfinity(systemIdleMs) || systemIdleMs < 0)
+        {
+            return false;
+        }
+
+        // Both timestamps come from Environment.TickCount64, which is 64-bit and does not
+        // wrap in any lifetime this app will see, so a plain subtraction is safe here.
+        var callbackAgeMs = nowMs - lastCallbackMs;
+        if (callbackAgeMs <= 0)
+        {
+            // A callback that landed between the caller's two readings, or a heartbeat that
+            // was just reset. Either way the hook is demonstrably alive.
+            return false;
+        }
+
+        return callbackAgeMs - systemIdleMs >= HookSilenceGraceMs;
+    }
+
+    // Advances the detector by one tick. Called only from TryRepairHooksIfNeeded, never
+    // from a callback: it needs GetLastInputInfo and it may write to the log, and neither
+    // belongs on a path that blocks all system input until it returns.
+    private static void UpdateHookLivenessState()
+    {
+        // One clock sample for both readings: taking nowMs twice would let the two ages be
+        // measured against different instants and invent a gap out of nothing.
+        var nowMs = GetMonotonicMilliseconds();
+        var systemIdleMs = GetSystemIdleMilliseconds();
+        var lastCallbackMs = Interlocked.Read(ref _lastHookCallbackMilliseconds);
+
+        // Capped at the threshold rather than free-running: ticks beyond it carry no
+        // information, and a counter that only ever grows is a counter that can overflow
+        // into a negative value and silently disarm the detector.
+        var ticks = HasHookSilenceEvidence(systemIdleMs, lastCallbackMs, nowMs)
+            ? Math.Min(Volatile.Read(ref _consecutiveHookSilenceTicks) + 1, HookSilenceTicksRequired)
+            : 0;
+
+        Interlocked.Exchange(ref _consecutiveHookSilenceTicks, ticks);
+
+        // Asked through the pure rule rather than inferred from `ticks` alone, so the whole
+        // decision lives in the one function the tests exercise and there is no second copy
+        // of it here to drift.
+        var suspected = IsHookDropSuspected(systemIdleMs, lastCallbackMs, nowMs, ticks, HookSilenceTicksRequired);
+        Interlocked.Exchange(ref _hookDropSuspected, suspected ? 1 : 0);
+
+        LogDegradationTransition();
+    }
+
+    // Announces an episode once instead of every 5 s. The comparison is against the string
+    // that was last logged, so a change of KIND (a hook that was merely missing is now also
+    // silent) is still reported, while a steady state never is.
+    private static void LogDegradationTransition()
+    {
+        var reason = GetHookDegradationReason();
+        if (string.Equals(reason, _loggedDegradationReason, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var previousReason = _loggedDegradationReason;
+        _loggedDegradationReason = reason;
+
+        if (reason == null)
+        {
+            Logger.Info(
+                $"Physical idle tracking recovered: the previous degradation ('{previousReason}') is no longer present and hook readings are trusted again.");
+            return;
+        }
+
+        Logger.Warn(
+            $"Physical idle tracking is degraded: {reason}. KeyboardHookInstalled={KeyboardHookInstalled} KeyboardHookError={LastKeyboardHookError} MouseHookInstalled={MouseHookInstalled} MouseHookError={LastMouseHookError}. Idle time is now measured from GetLastInputInfo, which cannot tell injected input from a real user, so an anti-idle tool can keep the machine looking busy while this lasts. A hook that stopped firing was most likely dropped by Windows for overrunning LowLevelHooksTimeout; that is reported here and never silently reinstalled.");
+    }
+
+    /// <summary>
+    /// A short description of why physical idle tracking cannot be trusted right now, or
+    /// <see langword="null"/> when it can. Intended for the tray tooltip and the log.
+    /// </summary>
+    /// <remarks>
+    /// Call this ONCE and use the answer. Asking KeyboardHookInstalled, then
+    /// MouseHookInstalled, then the drop latch as three separate questions lets a tick land
+    /// between two of them and produces a sentence that describes no instant that ever
+    /// existed. Every returned string is a literal under 30 characters so the caller's
+    /// "IdleLauncherTray: DEGRADED - " prefix still fits a 63-character tooltip.
+    /// </remarks>
+    public static string? GetHookDegradationReason()
+    {
+        // One snapshot into locals, for the reason above.
+        var keyboardInstalled = KeyboardHookInstalled;
+        var mouseInstalled = MouseHookInstalled;
+        var dropSuspected = Volatile.Read(ref _hookDropSuspected) != 0;
+
+        // Ordered most severe first. A hook that is missing outranks one that is merely
+        // suspected of having stopped, because the missing one is a fact and the suspicion
+        // about the other is inferred from the same silence.
+        if (!keyboardInstalled && !mouseInstalled)
+        {
+            return ReasonBothHooksMissing;
+        }
+
+        if (!keyboardInstalled)
+        {
+            return ReasonKeyboardHookMissing;
+        }
+
+        if (!mouseInstalled)
+        {
+            return ReasonMouseHookMissing;
+        }
+
+        return dropSuspected ? ReasonHooksStoppedFiring : null;
+    }
+
+    /// <summary>
+    /// Reports activity that happened somewhere our hooks cannot see it -- a session
+    /// unlock, where the password was typed on the secure desktop.
+    /// </summary>
+    /// <remarks>
+    /// Safe to call from the tray's UI thread or from a SystemEvents handler; never from a
+    /// hook callback, because it writes to the log synchronously.
+    /// </remarks>
+    public static void NotifyExternalActivity(string reason)
+    {
+        var describedReason = string.IsNullOrWhiteSpace(reason) ? "(unspecified)" : reason;
+        var nowMs = GetMonotonicMilliseconds();
+
+        // Advance-only, NOT a bare Exchange. A hook callback or the gamepad poll can be
+        // publishing a newer timestamp on another thread right now; overwriting it with our
+        // slightly older sample would move the idle clock backwards and hand the user back
+        // idle time they never accrued.
+        AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, nowMs);
+
+        // The heartbeat has to move too, not just the counters. Input on the secure desktop
+        // is invisible to a hook on the default desktop, so a lock/unlock cycle leaves the
+        // heartbeat as old as the lock was long while GetLastInputInfo reports the unlock
+        // keystroke as recent -- a gap that is real, benign, and would otherwise read as a
+        // dropped hook on the very next tick. Resetting the counters without the heartbeat
+        // would only postpone that by HookSilenceTicksRequired ticks.
+        AdvanceMonotonicTimestamp(ref _lastHookCallbackMilliseconds, nowMs);
+
+        // External activity is an absence of evidence, not evidence of health: it says we
+        // could not have seen this input, so nothing the counters accumulated across it
+        // means anything. Start the next episode from zero.
+        Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+        Interlocked.Exchange(ref _hookDropSuspected, 0);
+
+        Logger.Info(
+            $"External activity reported ({describedReason}). The idle clock was advanced and the hook-liveness detector was reset, because input this process cannot observe is not evidence about the hooks either way.");
     }
 
     private static void EnsureHooksStarted(bool forceImmediateRetry)
@@ -637,6 +952,15 @@ public static class PhysicalIdle
             if (newlyInstalledAnyHook)
             {
                 Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, nowMs);
+
+                // Same reasoning for the liveness detector. A hook installed one statement
+                // ago has not had the chance to fire, so silence from before this instant
+                // says nothing about it -- and the outage that just ended is exactly the
+                // kind of silence that would otherwise still be sitting in the heartbeat,
+                // reported as a fresh drop on the next tick.
+                Interlocked.Exchange(ref _lastHookCallbackMilliseconds, nowMs);
+                Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+                Interlocked.Exchange(ref _hookDropSuspected, 0);
             }
         }
     }
@@ -781,7 +1105,14 @@ public static class PhysicalIdle
 
         var effectiveWindowMs = GetEffectiveSystemIdleFailSafeWindowMs();
 
-        if (!HooksFullyInstalled)
+        // A suspected silent drop takes the same branch as a hook that never installed at
+        // all. From here the two are the same failure -- the callback is not running, so the
+        // hook's reading is stale by construction -- and the only difference is that this
+        // one still has a non-null handle, which is what made it invisible in the first
+        // place. Reusing the branch rather than adding a parallel one keeps both failures on
+        // one code path, and it is strictly more conservative: GetLastInputInfo can only
+        // ever report input MORE recently than a hook that has stopped seeing any.
+        if (!HooksFullyInstalled || Volatile.Read(ref _hookDropSuspected) != 0)
         {
             if (ShouldIgnoreSystemIdleSample(nowMs, sys, effectiveWindowMs))
             {
@@ -821,6 +1152,13 @@ public static class PhysicalIdle
 
     private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
+        // Heartbeat first, before the nCode guard, before the injected/ScrollLock filtering,
+        // before anything that can decide this event is uninteresting. "Windows called us"
+        // is the only fact this timestamp records, and every callback is proof of it --
+        // including the nCode < 0 ones we are required to pass straight through. One
+        // interlocked store on the system input path, no allocation, no branch.
+        Interlocked.Exchange(ref _lastHookCallbackMilliseconds, GetMonotonicMilliseconds());
+
         try
         {
             if (nCode >= 0)
@@ -871,6 +1209,12 @@ public static class PhysicalIdle
 
     private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
+        // Same heartbeat, same reasoning as KeyboardHookCallback: this records that the hook
+        // is still wired up, not that a human moved the mouse, so it is written for injected
+        // and nCode < 0 callbacks too. Either hook firing proves the chain is alive, which is
+        // why one timestamp serves both.
+        Interlocked.Exchange(ref _lastHookCallbackMilliseconds, GetMonotonicMilliseconds());
+
         try
         {
             if (nCode >= 0)
