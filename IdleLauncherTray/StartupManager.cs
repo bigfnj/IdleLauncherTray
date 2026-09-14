@@ -24,6 +24,11 @@ internal static class StartupManager
     /// Path.GetFullPath does NOT resolve 8.3 short names, junctions or symlinks, so a value
     /// written through one of those still reads as a mismatch; that needs
     /// GetFinalPathNameByHandle and an open handle to a file that may no longer exist.
+    /// <para>
+    /// Which is why GetStartupEnabled no longer decides enabled-versus-disabled from this
+    /// comparison at all. It is used for the two things it can still answer honestly: spotting
+    /// the legacy %APPDATA% path that is worth migrating, and reporting a mismatch to the log.
+    /// </para>
     /// </remarks>
     private static string? TryGetCanonicalExePath(string? command)
     {
@@ -72,11 +77,28 @@ internal static class StartupManager
         return expected != null && string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Reports whether Windows will start this app at logon.
+    /// </summary>
+    /// <remarks>
+    /// The question this answers is "will the app start", and the only fact Windows acts on is
+    /// that a value exists under our value name. So that is what is reported. The canonical
+    /// comparison below is only our guess at whether a value is <i>ours</i>, and
+    /// <see cref="TryGetCanonicalExePath"/> cannot see through 8.3 short names, junctions or
+    /// symlinks — a Run entry written through any of those failed the comparison, and the tray
+    /// then showed "Run at startup" unchecked while the app really did launch at every logon. A
+    /// user who wanted it off saw it already off and did nothing. A wrong guess about whose value
+    /// it is must not turn into a wrong statement about whether the app starts.
+    /// </remarks>
     public static bool GetStartupEnabled()
     {
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(AppPaths.RunRegSubKey, writable: false);
+
+            // `as string` is deliberate rather than lax. A Run value that is not REG_SZ or
+            // REG_EXPAND_SZ is not something Windows launches, so reading it as "no registration"
+            // is the true answer and not a gap in the check.
             var val = key?.GetValue(AppPaths.RunRegValueName) as string;
 
             if (string.IsNullOrWhiteSpace(val))
@@ -110,9 +132,16 @@ internal static class StartupManager
                 return true;
             }
 
+            // A value exists under our value name and canonicalises to neither path we know. Still
+            // ENABLED: Windows runs whatever is there, so that is what the tray must show.
+            //
+            // The mismatch remains worth knowing, because there are two very different stories
+            // behind it -- a path we simply cannot canonicalise (a short name, a junction, a
+            // symlink), or a different copy of this app that has claimed the same value name. Both
+            // paths go in the log, every time, so the one that matters is reconstructible.
             Logger.Warn(
-                $"Startup registry value exists but does not match the current portable executable. Value='{val}'. Startup will be treated as disabled in the tray UI.");
-            return false;
+                $"Startup registry value exists but does not canonicalise to the current executable. Reporting startup as ENABLED anyway, because Windows will run the stored command at logon regardless. Stored='{val}' Current='{CurrentStartupCommand()}'.");
+            return true;
         }
         catch (Exception ex)
         {

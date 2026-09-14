@@ -71,6 +71,49 @@ internal sealed class TempDataDirectory : IDisposable
 }
 
 /// <summary>
+/// Reads back whatever the product appended to its log after this object was created.
+/// <para>
+/// It remembers an offset rather than redirecting the log, because the log cannot be
+/// redirected per test: <c>Logger</c> snapshots its path once at type initialisation, and
+/// <see cref="TestDataDirectory"/> deliberately forces that to happen while the redirect is
+/// known to be on. So the log does not follow a <see cref="TempDataDirectory"/>, and the only
+/// way to isolate one test's output is to note where the file ended before it ran.
+/// </para>
+/// <para>
+/// Safe because assembly-wide parallelisation is off (see <c>AssemblyInfo.cs</c>): no other test
+/// is writing to the log in between.
+/// </para>
+/// </summary>
+internal sealed class LogCapture
+{
+    private readonly long _startOffset;
+
+    internal LogCapture() =>
+        _startOffset = File.Exists(Sut.Logger.LogPath) ? new FileInfo(Sut.Logger.LogPath).Length : 0L;
+
+    /// <summary>Everything the product has logged since this object was constructed.</summary>
+    internal string Text
+    {
+        get
+        {
+            if (!File.Exists(Sut.Logger.LogPath))
+            {
+                return string.Empty;
+            }
+
+            // FileShare.ReadWrite because Logger may still hold the file, and Min() because a
+            // rotation would leave the remembered offset past the end of a fresh file.
+            using var stream = new FileStream(
+                Sut.Logger.LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            stream.Seek(Math.Min(_startOffset, stream.Length), SeekOrigin.Begin);
+
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        }
+    }
+}
+
+/// <summary>
 /// Sets the process working directory for the lifetime of the scope. Used to prove that
 /// relative-path resolution is anchored on the executable's folder and not on wherever
 /// the process happens to be running.

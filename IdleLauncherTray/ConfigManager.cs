@@ -57,24 +57,84 @@ internal static class ConfigManager
             cfg.SystemIdleFailSafeWindowMs = AppConfig.MinimumSystemIdleFailSafeWindowMs;
         }
 
-        cfg.AppPath = TargetFilePolicy.NormalizePath(cfg.AppPath);
-        if (!string.IsNullOrWhiteSpace(cfg.AppPath) && !TargetFilePolicy.IsSupportedTarget(cfg.AppPath))
-        {
-            try
-            {
-                Logger.Warn($"Configuration contained an unsupported target type. Clearing AppPath. Path='{cfg.AppPath}'.");
-            }
-            catch
-            {
-                // Ignore.
-            }
-
-            cfg.AppPath = string.Empty;
-        }
+        // Store what the user wrote, not what it resolves to on this machine today.
+        // PrepareForStorage only trims and unquotes, both of which are lossless; it deliberately
+        // does NOT expand environment variables. This method runs on every Load AND every Save, so
+        // the previous NormalizePath call baked "%APPDATA%\tools\app.exe" down to one machine's
+        // absolute path within milliseconds of the app starting -- destroying the portable spelling
+        // the user chose, and any literal path containing %...%. Expansion now happens in
+        // TargetFilePolicy.ResolveForUse, at each point of use.
+        cfg.AppPath = TargetFilePolicy.PrepareForStorage(cfg.AppPath);
+        ApplyTargetPolicyTo(cfg);
 
         cfg.AppArguments = (cfg.AppArguments ?? string.Empty).Trim();
         cfg.TrayIconPath = (cfg.TrayIconPath ?? string.Empty).Trim();
         cfg.LastLaunchUtc = (cfg.LastLaunchUtc ?? string.Empty).Trim();
+    }
+
+    /// <summary>
+    /// Acts on whatever is wrong with the stored target, and records which fault it was.
+    /// </summary>
+    /// <remarks>
+    /// The two faults get opposite treatment, and the difference is the point of this method.
+    /// <para>
+    /// <b>An unsupported type is cleared.</b> The extension is a property of the string itself:
+    /// a ".txt" can never become launchable, on this machine or any other, so keeping it would only
+    /// preserve a setting that is guaranteed never to work.
+    /// </para>
+    /// <para>
+    /// <b>An unparseable path is kept.</b> Now that the stored value keeps its environment
+    /// variables, whether it parses is a property of the machine reading it — "%TOOLS%\app.exe"
+    /// can fail here and be perfectly valid on the box the config came from. Clearing would
+    /// destroy the user's setting merely for opening the app on the wrong machine, and because
+    /// normalisation runs on Save too, the loss is written to disk immediately and is not
+    /// recoverable. Nothing dangerous is kept: ClassifyTarget still refuses it, so the launch
+    /// path will not run it, and the fault is now in the log with both spellings of the path.
+    /// </para>
+    /// </remarks>
+    private static void ApplyTargetPolicyTo(AppConfig cfg)
+    {
+        switch (TargetFilePolicy.ClassifyTarget(cfg.AppPath))
+        {
+            case TargetPathStatus.UnsupportedType:
+                TryWarn(
+                    "Configuration contained an unsupported target TYPE, so AppPath was cleared. " +
+                    $"Supported types are {TargetFilePolicy.SupportedExtensionsDisplay}. " +
+                    $"Path='{TargetFilePolicy.ForDisplay(cfg.AppPath)}'.");
+                cfg.AppPath = string.Empty;
+                break;
+
+            case TargetPathStatus.Unparseable:
+                TryWarn(
+                    "Configuration contained a target PATH that Windows cannot interpret -- it is too long, or holds " +
+                    "characters a path cannot. This is not an unsupported target type; the type was never reached. " +
+                    "AppPath has been KEPT rather than cleared, because the stored value is no longer environment-expanded " +
+                    "and can be valid on another machine -- but nothing will launch it here until it parses. " +
+                    $"Stored='{TargetFilePolicy.ForDisplay(cfg.AppPath)}' " +
+                    $"Expanded='{TargetFilePolicy.ForDisplay(TargetFilePolicy.ResolveForUse(cfg.AppPath))}'.");
+                break;
+
+            default:
+                // Supported, or nothing stored at all. Nothing to say and nothing to do.
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Logger already swallows its own failures, so this guard is belt and braces — but
+    /// normalisation runs inside Load's catch-all, where a throw would be reported as "failed to
+    /// load config" and quarantine a file that was perfectly readable.
+    /// </summary>
+    private static void TryWarn(string message)
+    {
+        try
+        {
+            Logger.Warn(message);
+        }
+        catch
+        {
+            // Ignore.
+        }
     }
 
 
@@ -170,14 +230,38 @@ internal static class ConfigManager
             NormalizeInPlace(cfg);
             Directory.CreateDirectory(AppPaths.BaseDir);
 
-            // Write atomically to reduce the chance of a partially-written config file
-            // (e.g. power loss / crash mid-write). On failure we still need to remove
-            // the stale .tmp file in the finally below — otherwise a successful
-            // WriteAllText followed by a failed Move would leave orphaned junk in
-            // %APPDATA% that survives across runs.
-            var json = JsonSerializer.Serialize(cfg, Options);
+            // Stage, make durable, then publish with a rename — in that order, because the order
+            // is the whole guarantee.
+            //
+            // What this protects against: File.Move over an existing file is atomic on NTFS, so a
+            // reader sees either the entire old config or the entire new one and never a mixture;
+            // and Flush(flushToDisk: true) issues FlushFileBuffers on the staging file, so its
+            // bytes are on the platter before the rename is even attempted. The previous
+            // File.WriteAllText left those bytes in the OS write cache, which is precisely how a
+            // power cut could publish a complete rename over a file of zeros — the one failure the
+            // comment here used to claim protection from.
+            //
+            // What it still does NOT protect against: the directory entry the rename creates is
+            // not itself flushed, and Windows offers no supported way to fsync a directory. A power
+            // cut in the window between the rename and NTFS committing that metadata can therefore
+            // still lose the save outright. That is a survivable outcome — the previous config is
+            // intact and complete — whereas publishing a torn one was not, which is why the flush
+            // is the half worth having.
+            //
+            // The finally below still has to remove the staging file: a successful Move renames it
+            // away, but a Move that throws leaves orphaned junk in %APPDATA% that survives runs.
+            var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(cfg, Options);
 
-            File.WriteAllText(tmpPath, json);
+            // FileMode.Create matches what File.WriteAllText did: truncate an orphaned .tmp from an
+            // earlier failure rather than append to it. SerializeToUtf8Bytes with the same Options
+            // emits the same UTF-8, BOM-free bytes WriteAllText produced, so nothing about the file
+            // on disk changes — only when it reaches the disk.
+            using (var stream = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(jsonBytes);
+                stream.Flush(flushToDisk: true);
+            }
+
             File.Move(tmpPath, AppPaths.ConfigPath, overwrite: true);
         }
         catch (Exception ex)
@@ -194,9 +278,9 @@ internal static class ConfigManager
         }
         finally
         {
-            // Clean up the staging file if anything went wrong between WriteAllText
-            // and Move. The Move succeeds by renaming so the .tmp normally vanishes,
-            // but if Move threw we still need to remove the orphaned .tmp.
+            // Clean up the staging file if anything went wrong between the flush and the
+            // Move. The Move succeeds by renaming so the .tmp normally vanishes, but if
+            // Move threw we still need to remove the orphaned .tmp.
             try
             {
                 if (File.Exists(tmpPath))
