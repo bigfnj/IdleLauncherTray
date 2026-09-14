@@ -23,9 +23,12 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
-## Unreleased
+## v2.6 highlights
 
-Three changes, all of them about the app telling the truth about itself.
+Version 2.6 finishes what v2.5 started. v2.5 fixed the ways this app could silently stop working;
+v2.6 makes it **say so**, and closes the remaining places where it lied about itself or quietly
+destroyed something. Every item below was either reported by the app's own log or found by an audit
+of code that had no test covering it.
 
 - **The tray tooltip now reports state.** Hover the icon and it says what the launcher is doing:
   `Idle 3:20/5:00`, `CPU 37% > 10%`, `Target missing: app.exe`, `Disarmed until you use the PC`,
@@ -39,6 +42,30 @@ Three changes, all of them about the app telling the truth about itself.
 - **Run Now no longer disarms the launcher.** Clicking Run Now and then walking away used to
   switch automatic launching off for the entire away period, because the re-arm only happens after
   fresh user activity and there is none. Automatic launches still disarm.
+- **Hooks that Windows silently drops are now detected.** Windows unhooks a low-level keyboard or
+  mouse hook whose callback overruns its timeout, and it does *not* clear the handle — so the old
+  "is the handle non-null" check could never notice, and the app went on reporting a machine as
+  fully idle forever. It now compares its own callback heartbeat against the system's input clock,
+  reports `input hooks stopped firing`, and stops trusting the dead hook in favour of the Windows
+  idle reading. Detection only: it does not reinstall hooks behind your back.
+- **Waking from sleep no longer counts as idle time.** Nothing the user does to wake a suspended
+  machine reaches a low-level hook, so a PC that slept overnight used to read as "idle for nine
+  hours" the instant it woke, and could launch before the user had touched anything.
+- **A corrupt config is moved aside instead of overwritten.** An unreadable `config.json` (a power
+  cut mid-write is the realistic cause) used to be replaced with defaults within milliseconds of
+  the next launch, taking the target path, arguments, thresholds and custom icon with it. It is now
+  preserved as `config.corrupt-<timestamp>.json` so it can be recovered by hand.
+- **Absurd config values are clamped at both ends.** An `IdleMinutes` large enough to overflow the
+  seconds conversion produced a *negative* threshold, which every tick satisfies — the app launched
+  its target continuously. An unbounded fail-safe window did the opposite and stopped it launching
+  at all.
+- **Uninstall no longer reaches outside its own folder.** The attribute pass before deleting the
+  settings directory followed junctions and directory symlinks, clearing read-only, hidden and
+  system flags on whatever was on the other side. The delete itself was always confined; the
+  attribute write was not.
+- **A crash on a background thread now tells you.** It was fatal either way, but only the UI-thread
+  path showed a dialog, so the tray icon simply vanished with no explanation and no pointer to the
+  log.
 
 ## v2.5 highlights
 

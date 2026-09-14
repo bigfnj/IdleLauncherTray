@@ -40,6 +40,8 @@ These require a Windows desktop session and user interaction:
 - With **Allow launching while the PC is locked** OFF, lock the workstation (Win+L) and wait past the idle threshold; confirm nothing launches and the log records `reason=WorkstationLocked` with `sessionOk=False`. Unlock and confirm the launcher does **not** fire on the first tick after sign-in.
 - Turn **Allow launching while the PC is locked** ON, repeat the lock test, and confirm the target does launch.
 - Confirm the log records both halves of the session subscription: `Subscribed to session switch notifications` at startup and a `Session became unavailable` / `Session became available` pair per lock cycle.
+- Sleep the machine, wake it, and confirm the log records `Resumed from sleep; idle clock reset` and that the tooltip restarts its idle count from near zero. Without this the suspended hours count as idle and the target can launch before you have touched anything.
+- Corrupt `%APPDATA%\IdleLauncherTray\config.json` (truncate it mid-object) while the app is closed, then start it. Confirm a `config.corrupt-<timestamp>.json` appears beside it holding the original text, that the app starts on defaults, and that the original is **not** left to be overwritten.
 - Toggle **Run at startup** on and off; confirm the HKCU Run entry points to the current portable executable path and is removed when disabled.
 - Use **Uninstall (remove settings + startup)**; confirm `%APPDATA%\IdleLauncherTray` settings are removed, startup registration is removed, and the portable executable remains in place.
 

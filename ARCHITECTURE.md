@@ -219,12 +219,20 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 
 ## Version
 
-Current version: **2.5.0**
+Current version: **2.6.0**
 
 The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.csproj`. The release
 workflow derives the shipped assembly version from the git tag instead, so a tagged build always
 matches its tag regardless of what the csproj says.
 
+- **v2.6** — self-reporting pass. v2.5 fixed the ways the app could silently stop working; v2.6
+  makes it say so. The tray tooltip now carries the live reason code and a `DEGRADED -` prefix
+  when something is broken rather than merely waiting. Adds session-lock gating so an armed
+  launcher cannot fire behind the lock screen, resume-from-sleep handling, and detection of hooks
+  that Windows drops without clearing the handle. Also closes an audit's findings: a corrupt
+  config is quarantined instead of overwritten, `IdleMinutes` is clamped at both ends (an overflow
+  produced a negative threshold that every tick satisfied), the uninstall attribute pass no longer
+  follows junctions out of its own folder, and a background-thread crash now shows a dialog.
 - **v2.5** — correctness pass over the idle state machine. Fixes several ways the app could
   silently stop working: an idle clock that could never exceed 30s when one input hook failed, a
   CPU guard that stopped guarding after any long gap, re-arming without an idle measurement, and a
