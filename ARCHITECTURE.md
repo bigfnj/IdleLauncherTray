@@ -257,6 +257,18 @@ The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.c
 workflow derives the shipped assembly version from the git tag instead, so a tagged build always
 matches its tag regardless of what the csproj says.
 
+- **v2.7.2** — tunes the v2.6.0 drop detector after it produced nine false alarms in 78 minutes on
+  its first real desktop. The rule is `gap = (now - lastCallback) - systemIdle`, written on the
+  assumption that `systemIdle` carries information. When continuous input pins that term near zero
+  the expression degenerates into a bare hook-liveness timeout, and the two cases stop being
+  separable: a dropped hook and a merely quiet one produce identical, identically-growing numbers,
+  so no amount of trend analysis can tell them apart. Only elapsed time can, because a live hook
+  eventually fires. `HookSilenceTicksRequired` therefore goes 3 → 30 (15 s → 150 s), sized against
+  the longest measured false episode (120 s). Also splits `HookSilenceGapMs` out as a pure function
+  so the warning can print the evidence it previously withheld, and makes a self-clearing episode
+  report itself as the proven false alarm it is. The proof is structural: `EnsureHooksStarted`
+  returns early while the handles are non-null and nothing else calls `SetWindowsHookEx`, so a hook
+  that fires again was never dropped.
 - **v2.7.1** — fixes two faults v2.7.0 introduced the same morning, both found by its own
   post-release audit. Keeping the stored path unexpanded made "has a supported extension" a
   property of the current machine's environment, so an undefined `%VAR%` was classified as an

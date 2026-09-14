@@ -20,6 +20,7 @@
 
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -281,19 +282,37 @@ internal static class PhysicalIdle
     // ONLY THE LOCK SCREEN IS PROPERLY EXCUSED, and this margin is the entire excuse for the
     // rest. SetHookSilenceExpected is wired to SessionLock, ConsoleDisconnect and
     // RemoteDisconnect only. A UAC PROMPT RAISES NO SessionSwitch AT ALL, so nothing suspends
-    // the detector while one is on screen: a prompt left up for longer than these 10 seconds,
-    // followed by about 15 seconds (HookSilenceTicksRequired tray ticks) in which the user
-    // does not move the mouse, really does latch the detector and flip the tray to a DEGRADED
-    // warning saying Windows dropped the hook. That is a false alarm this code does not
-    // prevent. It is self-clearing -- the next real mouse move or keystroke fires a callback
-    // and the gap collapses -- but it is reachable, and this margin is a mitigation for it,
-    // not a fix.
+    // the detector while one is on screen.
     private const long HookSilenceGraceMs = 10000;
 
-    // Consecutive ticks of evidence required before the state flips. The tray ticks every
-    // 5 s, so this is ~15 s of sustained disagreement: fast against idle thresholds that are
-    // measured in minutes, and long enough that one unlock cannot trip it on its own.
-    private const int HookSilenceTicksRequired = 3;
+    // MEASURED 2026-09-14, first day this detector ran on a real desktop rather than in the
+    // suite. It produced NINE false alarms in 78 minutes, every one of them self-clearing.
+    // That they cleared is the proof they were false: nothing in this class reinstalls a
+    // hook (EnsureHooksStarted returns early while the handles are non-null, and
+    // UpdateHookLivenessState only does arithmetic), so a hook Windows had really dropped
+    // could never have fired again. It fired 9 times, therefore it was alive 9 times.
+    //
+    // THE ROOT CAUSE IS THAT THE TWO CASES ARE NOT DISTINGUISHABLE FROM THESE TWO CLOCKS.
+    // The rule is a disagreement, gap = (now - lastCallback) - systemIdle, and it was written
+    // assuming systemIdle is a meaningful number. On a machine whose idle clock is pinned
+    // near zero by continuous input -- 239 resets in 150 seconds on the box that found this,
+    // never once above 0.5 s -- the subtraction degenerates into "has our hook fired in the
+    // last HookSilenceGraceMs?", which is a bare liveness timeout, not a cross-check.
+    //
+    // Do not try to rescue it by requiring the gap to GROW. That is the obvious next idea and
+    // it provably cannot work: while input is continuous, systemIdle stays ~0 and the gap
+    // grows at exactly one tick interval per tick in BOTH cases, a genuinely dropped hook and
+    // a merely quiet one alike. The numbers are identical. The only thing that separates them
+    // is time, because a live hook eventually fires and a dead one never does.
+    //
+    // So the confirmation window is the only honest lever, and this is it. The longest false
+    // episode observed carried 120 s of unbroken evidence; 150 s clears that with margin. It
+    // costs detection latency for a real drop and that trade is deliberate: this guard exists
+    // to protect an idle threshold measured in MINUTES (15 on the box in question), so being
+    // sure at 150 s beats being wrong at 15 s. A false alarm here is not cosmetic -- it makes
+    // GetIdleMilliseconds fall back to GetLastInputInfo, silently surrendering the one thing
+    // this app does that a stopwatch does not, which is ignoring injected input.
+    private const int HookSilenceTicksRequired = 30;
 
     // Advanced only from the tick (TryRepairHooksIfNeeded), which is the only periodic entry
     // point into this class. Every other writer only ever RESETS it to zero.
@@ -324,6 +343,23 @@ internal static class PhysicalIdle
     // The reason string last handed to the log, so an episode is announced once instead of
     // every 5 s. Only ever touched from the tick, which is single-threaded with itself.
     private static string? _loggedDegradationReason;
+
+    // DIAGNOSTICS ONLY -- nothing decides anything from these. They exist so the warning can
+    // print the evidence beside the conclusion, which the 2026-09-14 version did not, and an
+    // hour went on recovering them by hand. Written under _hookLivenessLock by the tick and
+    // read outside it by LogDegradationTransition; a torn read would misprint a log line and
+    // nothing worse, which is why they are plain longs and not part of the locked invariant.
+    private static long _lastSilenceGapMs;
+    private static long _lastSilenceSystemIdleMs;
+    private static long _lastSilenceCallbackAgeMs;
+
+    // When the current episode was announced, so the recovery line can say how long it ran.
+    private static long _degradationAnnouncedAtMs;
+
+    // Every episode that clears is a PROVEN false alarm, because no path in this class
+    // reinstalls a hook, so a hook that fires again was never dropped. Counting them turns a
+    // vague "it keeps popping up" into a number the next reader can act on.
+    private static int _provenFalseAlarmCount;
 
     // Plain literals, never interpolated. The tray prefixes these with
     // "IdleLauncherTray: DEGRADED - " (29 characters) and drops the result into a NotifyIcon
@@ -902,28 +938,49 @@ internal static class PhysicalIdle
     // it did, the app would go back to trusting a dead hook at exactly the moment the
     // machine looks idle, which is the moment it decides to launch. The gap is cleared by a
     // callback that actually fires, by a hook being installed, or by NotifyExternalActivity.
-    private static bool HasHookSilenceEvidence(double systemIdleMs, long lastCallbackMs, long nowMs)
+    /// <summary>
+    /// The disagreement between the two clocks in milliseconds, or <see cref="double.NaN"/>
+    /// when there is no usable cross-check to disagree with.
+    /// </summary>
+    /// <remarks>
+    /// Split out of <see cref="HasHookSilenceEvidence"/> so the NUMBER is available, not only
+    /// the verdict. Diagnosing the 2026-09-14 false alarms took about an hour and nearly all
+    /// of it went on reconstructing three values this method returns, because the warning
+    /// announced a cause and printed no evidence. A rule that logs only its conclusion cannot
+    /// be audited from a user's log, and this one was wrong.
+    /// <para>
+    /// A negative result is a live hook: the heartbeat is FRESHER than the system's last
+    /// input, which is what a callback that just fired looks like.
+    /// </para>
+    /// </remarks>
+    internal static double HookSilenceGapMs(double systemIdleMs, long lastCallbackMs, long nowMs)
     {
         // An unavailable cross-check is not evidence of failure. GetSystemIdleMilliseconds
         // returns PositiveInfinity when GetLastInputInfo fails; NaN cannot come from there,
-        // but every comparison below would silently answer false for it, so reject it where
-        // the reason is visible rather than by accident.
+        // but every comparison in the caller would silently answer false for it, so reject it
+        // where the reason is visible rather than by accident.
         if (double.IsNaN(systemIdleMs) || double.IsInfinity(systemIdleMs) || systemIdleMs < 0)
         {
-            return false;
+            return double.NaN;
         }
 
         // Both timestamps come from Environment.TickCount64, which is 64-bit and does not
-        // wrap in any lifetime this app will see, so a plain subtraction is safe here.
-        var callbackAgeMs = nowMs - lastCallbackMs;
-        if (callbackAgeMs <= 0)
-        {
-            // A callback that landed between the caller's two readings, or a heartbeat that
-            // was just reset. Either way the hook is demonstrably alive.
-            return false;
-        }
+        // wrap in any lifetime this app will see, so a plain subtraction is safe here. No
+        // special case for a callback that landed between the caller's two readings: that
+        // makes the age zero or negative, the gap then cannot reach a positive grace margin,
+        // and the general expression already says so.
+        return (nowMs - lastCallbackMs) - systemIdleMs;
+    }
 
-        return callbackAgeMs - systemIdleMs >= HookSilenceGraceMs;
+    private static bool HasHookSilenceEvidence(double systemIdleMs, long lastCallbackMs, long nowMs)
+    {
+        var gapMs = HookSilenceGapMs(systemIdleMs, lastCallbackMs, nowMs);
+
+        // Tested explicitly rather than left to `NaN >= grace` answering false on its own.
+        // That happens to be correct in C#, but it is the same "silently answers false"
+        // accident the guard inside HookSilenceGapMs exists to avoid, and a reader should not
+        // have to know IEEE comparison rules to see that the unavailable case is handled.
+        return !double.IsNaN(gapMs) && gapMs >= HookSilenceGraceMs;
     }
 
     // Advances the detector by one tick. Called only from TryRepairHooksIfNeeded, never
@@ -976,6 +1033,18 @@ internal static class PhysicalIdle
 
                 Interlocked.Exchange(ref _consecutiveHookSilenceTicks, ticks);
 
+                // Published from the same three readings the verdict was computed from, so the
+                // logged evidence can never describe a different instant than the decision it
+                // is supposed to justify. Recomputing them at log time was the obvious cheaper
+                // option and it is exactly the bug this file keeps finding in itself: a second
+                // reading of a live clock is a second instant.
+                var gapMs = HookSilenceGapMs(systemIdleMs, lastCallbackMs, nowMs);
+                Interlocked.Exchange(ref _lastSilenceGapMs, double.IsNaN(gapMs) ? long.MinValue : (long)gapMs);
+                Interlocked.Exchange(
+                    ref _lastSilenceSystemIdleMs,
+                    double.IsNaN(systemIdleMs) || double.IsInfinity(systemIdleMs) ? long.MinValue : (long)systemIdleMs);
+                Interlocked.Exchange(ref _lastSilenceCallbackAgeMs, nowMs - lastCallbackMs);
+
                 // Asked through the pure rule rather than inferred from `ticks` alone, so the
                 // whole decision lives in the one function the tests exercise and there is no
                 // second copy of it here to drift.
@@ -990,6 +1059,37 @@ internal static class PhysicalIdle
         // safe: the only thing that can have changed it in between is a resetter clearing it,
         // and an episode that was just cancelled is not one worth announcing.
         LogDegradationTransition();
+    }
+
+    /// <summary>
+    /// Renders a millisecond diagnostic for the log.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="long.MinValue"/> is the one sentinel, meaning the reading was unavailable:
+    /// GetLastInputInfo failed so there was no cross-check, or an episode ended without a
+    /// recorded start. Printed as a word, because "-9223372036854775808ms" in a log a human is
+    /// meant to act on is worse than no number at all.
+    /// <para>
+    /// Ordinary negatives are printed as-is and are NOT an error: a negative clock gap means
+    /// the heartbeat is fresher than the system's last input, which is what a healthy hook
+    /// looks like.
+    /// </para>
+    /// <para>
+    /// InvariantCulture on the one call that formats a decimal. The same omission in
+    /// <c>LogCleanupOutcome</c> was a real finding in this repo, and a log read on a
+    /// comma-decimal machine should not render "1,5s".
+    /// </para>
+    /// </remarks>
+    private static string FormatMs(long valueMs)
+    {
+        if (valueMs == long.MinValue)
+        {
+            return "unavailable";
+        }
+
+        return Math.Abs(valueMs) < 1000
+            ? valueMs.ToString(CultureInfo.InvariantCulture) + "ms"
+            : (valueMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture) + "s";
     }
 
     // Announces an episode once instead of every 5 s. The comparison is against the string
@@ -1022,14 +1122,36 @@ internal static class PhysicalIdle
         // returned -- and it costs at most one duplicate line, which is the cheaper mistake.
         if (reason == null)
         {
+            // A cleared SILENCE episode is not merely "better now", it is proof the alarm was
+            // wrong: EnsureHooksStarted returns early while the handles are non-null and
+            // nothing else here calls SetWindowsHookEx, so a hook that fires again was never
+            // dropped. Say so, and count it. A cleared MISSING-hook episode is a real repair
+            // and gets the ordinary sentence.
+            if (string.Equals(previousReason, ReasonHooksStoppedFiring, StringComparison.Ordinal))
+            {
+                var falseAlarms = Interlocked.Increment(ref _provenFalseAlarmCount);
+                var announcedAtMs = Interlocked.Read(ref _degradationAnnouncedAtMs);
+                var lastedMs = announcedAtMs == 0 ? long.MinValue : GetMonotonicMilliseconds() - announcedAtMs;
+
+                Logger.Info(
+                    $"Physical idle tracking recovered: the hooks were NEVER dropped and this was a false alarm (number {falseAlarms} this session, episode lasted {FormatMs(lastedMs)}). A hook callback fired again, and nothing in this app reinstalls a hook, so it was alive the whole time. If this number keeps climbing the detector is too eager on this machine, not the hooks.");
+                _loggedDegradationReason = reason;
+                return;
+            }
+
             Logger.Info(
                 $"Physical idle tracking recovered: the previous degradation ('{previousReason}') is no longer present and hook readings are trusted again.");
             _loggedDegradationReason = reason;
             return;
         }
 
+        // The evidence, then the conclusion. The previous version printed only the conclusion
+        // and asserted a cause ("most likely dropped by Windows for overrunning
+        // LowLevelHooksTimeout"), which turned out to be wrong nine times in 78 minutes on the
+        // first real desktop it ran on, and left nothing in the log to notice that with.
         Logger.Warn(
-            $"Physical idle tracking is degraded: {reason}. KeyboardHookInstalled={KeyboardHookInstalled} KeyboardHookError={LastKeyboardHookError} MouseHookInstalled={MouseHookInstalled} MouseHookError={LastMouseHookError}. Idle time is now measured from GetLastInputInfo, which cannot tell injected input from a real user, so an anti-idle tool can keep the machine looking busy while this lasts. A hook that stopped firing was most likely dropped by Windows for overrunning LowLevelHooksTimeout; that is reported here and never silently reinstalled.");
+            $"Physical idle tracking is degraded: {reason}. EVIDENCE: clockGap={FormatMs(Interlocked.Read(ref _lastSilenceGapMs))} (systemIdle={FormatMs(Interlocked.Read(ref _lastSilenceSystemIdleMs))}, hookQuietFor={FormatMs(Interlocked.Read(ref _lastSilenceCallbackAgeMs))}), sustained for {Volatile.Read(ref _consecutiveHookSilenceTicks)} of {HookSilenceTicksRequired} required ticks. KeyboardHookInstalled={KeyboardHookInstalled} KeyboardHookError={LastKeyboardHookError} MouseHookInstalled={MouseHookInstalled} MouseHookError={LastMouseHookError}. Idle time is now measured from GetLastInputInfo, which cannot tell injected input from a real user, so an anti-idle tool can keep the machine looking busy while this lasts. If this clears on its own it was a FALSE ALARM, because nothing here reinstalls a hook.");
+        Interlocked.Exchange(ref _degradationAnnouncedAtMs, GetMonotonicMilliseconds());
         _loggedDegradationReason = reason;
     }
 

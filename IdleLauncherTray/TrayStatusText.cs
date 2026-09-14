@@ -258,7 +258,7 @@ internal static class TrayStatusText
     private static int BodyBudget(string suffix) => MaxLength - suffix.Length;
 
     /// <summary>
-    /// The trailing " - CPU 10% - v2.7.1". Bounded by construction: the threshold is normalised to
+    /// The trailing " - CPU 10% - v1.2.3". Bounded by construction: the threshold is normalised to
     /// two digits and the version is clamped, so the suffix can never grow enough to crowd out the
     /// status it follows.
     /// </summary>

@@ -195,6 +195,26 @@ internal static class PhysicalIdle
 
     internal static string ReasonHooksStoppedFiring => Product.ReadConst<string>(TypeName, nameof(ReasonHooksStoppedFiring));
 
+    /// <summary>
+    /// The log's millisecond formatter. Private in the product, and reached here for the
+    /// reason it exists: it runs ONLY while an incident is being reported, so a throw or a
+    /// comma-decimal in it would corrupt the one message that explains the fault.
+    /// </summary>
+    internal static string FormatMs(long valueMs) =>
+        (string)Product.CallStatic(TypeName, nameof(FormatMs), valueMs)!;
+
+    /// <summary>
+    /// The raw disagreement between the two clocks, in milliseconds, or
+    /// <see cref="double.NaN"/> when there is no usable cross-check.
+    /// </summary>
+    internal static double HookSilenceGapMs(double systemIdleMs, long lastCallbackMs, long nowMs) =>
+        (double)Product.CallStatic(
+            TypeName,
+            nameof(HookSilenceGapMs),
+            systemIdleMs,
+            lastCallbackMs,
+            nowMs)!;
+
     internal static bool IsHookDropSuspected(
         double systemIdleMs,
         long lastCallbackMs,

@@ -37,6 +37,28 @@ Three things worth knowing before you use it:
 
 When the variable is unset or blank the app behaves exactly as it always has. Uninstall deletes whichever directory is in effect, so point it somewhere the app owns rather than at a folder holding anything else.
 
+## v2.7.2 highlights
+
+The dropped-hook detector added in v2.6 met its first real desktop and cried wolf nine times in
+78 minutes. This release makes it trustworthy.
+
+- **"Input hooks stopped firing" no longer fires when the hooks are fine.** The check compares its
+  own callback heartbeat against the Windows input clock and calls a disagreement a dropped hook.
+  On a machine whose input clock is pinned near zero by continuous activity, that subtraction
+  quietly stops being a comparison and becomes "has the hook fired in the last ten seconds", which
+  is a much twitchier question. The confirmation window is now 150 seconds instead of 15, chosen
+  against the longest false alarm actually measured (120 seconds of unbroken evidence). A real
+  dropped hook is still caught, just later, and "later" here is minutes inside a threshold measured
+  in quarter-hours.
+- **The warning now prints its evidence.** It used to state a cause it could not know, naming the
+  Windows hook timeout, with no numbers to check it against. It now logs the clock gap, the system
+  idle reading and how long the hook has actually been quiet, so the next person can tell in one
+  line what took an hour to reconstruct.
+- **A false alarm now says so out loud.** Nothing in the app reinstalls a hook, so an alarm that
+  clears by itself proves the hook was alive the whole time. The recovery message states that
+  plainly and counts how many times it has happened, instead of reporting a clean recovery from a
+  fault that never existed.
+
 ## v2.7.1 highlights
 
 The post-release audit of v2.7.0 found two faults that v2.7.0 itself had introduced that morning,
@@ -144,7 +166,8 @@ of code that had no test covering it.
   "is the handle non-null" check could never notice, and the app went on reporting a machine as
   fully idle forever. It now compares its own callback heartbeat against the system's input clock,
   reports `input hooks stopped firing`, and stops trusting the dead hook in favour of the Windows
-  idle reading. Detection only: it does not reinstall hooks behind your back.
+  idle reading. Detection only: it does not reinstall hooks behind your back. (This detector was
+  too eager as shipped; see the v2.7.2 notes above for what that cost and how it was tuned.)
 - **Waking from sleep no longer counts as idle time.** Nothing the user does to wake a suspended
   machine reaches a low-level hook, so a PC that slept overnight used to read as "idle for nine
   hours" the instant it woke, and could launch before the user had touched anything.

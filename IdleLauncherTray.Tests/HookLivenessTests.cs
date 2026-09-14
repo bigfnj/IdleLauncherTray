@@ -778,6 +778,158 @@ public sealed class HookLivenessTests
         }
     }
 
+    // ---------------------------------------------------------------------------------
+    // 2026-09-14 incident: nine false alarms in 78 minutes, the first day this detector ran
+    // on a real desktop. Everything below this line exists because of that, and every number
+    // in it was MEASURED on the machine that produced it, not chosen.
+    // ---------------------------------------------------------------------------------
+
+    // The longest false episode carried 120 s of unbroken evidence before a callback finally
+    // landed and collapsed the gap. Anything at or under this must not be enough to latch, or
+    // that episode ships again.
+    private const long LongestObservedFalseEpisodeMs = 120_000;
+
+    [Fact]
+    public void ConfirmationWindow_IsLongerThanTheLongestMeasuredFalseAlarm()
+    {
+        // THE REGRESSION TEST FOR THE INCIDENT. The window is the entire fix: with the system
+        // idle clock pinned near zero the rule degenerates into a bare "has the hook fired
+        // lately", so how long we wait before believing it is the only lever left.
+        //
+        // This is deliberately asserted against the SHIPPED constant. Every other test in this
+        // file passes requiredTicks as a literal 3, which is why changing the constant from 3
+        // to 30 broke nothing and the real window went unguarded through four releases.
+        var windowMs = (long)PhysicalIdle.HookSilenceTicksRequired * TrayTickMs;
+
+        Assert.True(
+            windowMs > LongestObservedFalseEpisodeMs,
+            $"The confirmation window is {windowMs} ms ({PhysicalIdle.HookSilenceTicksRequired} ticks x {TrayTickMs} ms). "
+                + $"The longest false alarm measured on a real desktop sustained {LongestObservedFalseEpisodeMs} ms of "
+                + "unbroken evidence, so a window this short reports it as a dropped hook again.");
+    }
+
+    [Fact]
+    public void ConfirmationWindow_StaysFarBelowTheIdleThresholdItProtects()
+    {
+        // The other side of the same trade. Waiting longer is only free while it stays small
+        // against the idle threshold this guard protects; the shortest one the app allows is
+        // one minute. Without this, "make the window bigger" is an unbounded answer to every
+        // future false alarm, ending at a detector that never fires at all.
+        var windowMs = (long)PhysicalIdle.HookSilenceTicksRequired * TrayTickMs;
+
+        Assert.True(
+            windowMs <= 300_000,
+            $"The confirmation window has grown to {windowMs} ms. Past ~5 minutes it is no longer a "
+                + "detector, and the fallback it guards would be wrong for longer than the fault it reports.");
+    }
+
+    [Theory]
+    [InlineData(24)]
+    [InlineData(20)]
+    [InlineData(10)]
+    public void IsHookDropSuspected_AtTheMeasuredFalseAlarmLength_DoesNotLatch(int ticksOfEvidence)
+    {
+        // 24 ticks is the 120 s episode, replayed. The evidence is real on every one of these
+        // ticks -- Windows saw input, our callback did not run -- and it must still not be
+        // enough, because on the machine that produced it the hook was alive the whole time
+        // and proved it by firing again.
+        Assert.False(
+            Suspect(
+                systemIdleMs: 0,
+                callbackAgeMs: (long)ticksOfEvidence * TrayTickMs,
+                consecutiveSuspectTicks: ticksOfEvidence,
+                requiredTicks: PhysicalIdle.HookSilenceTicksRequired));
+    }
+
+    [Fact]
+    public void IsHookDropSuspected_OnceTheFullWindowIsMet_StillLatches()
+    {
+        // The detector must not have been turned off by widening it. Same shape as above, one
+        // tick past the requirement.
+        var ticks = PhysicalIdle.HookSilenceTicksRequired;
+
+        Assert.True(
+            Suspect(
+                systemIdleMs: 0,
+                callbackAgeMs: (long)ticks * TrayTickMs,
+                consecutiveSuspectTicks: ticks,
+                requiredTicks: ticks));
+    }
+
+    [Fact]
+    public void HookSilenceGapMs_WhenTheCrossCheckIsUnavailable_IsNotANumber()
+    {
+        // GetSystemIdleMilliseconds returns PositiveInfinity when GetLastInputInfo fails.
+        // A missing cross-check must not read as a gap of infinity, which would be evidence.
+        Assert.True(double.IsNaN(PhysicalIdle.HookSilenceGapMs(double.PositiveInfinity, NowMs - 60_000, NowMs)));
+        Assert.True(double.IsNaN(PhysicalIdle.HookSilenceGapMs(double.NaN, NowMs - 60_000, NowMs)));
+        Assert.True(double.IsNaN(PhysicalIdle.HookSilenceGapMs(-1, NowMs - 60_000, NowMs)));
+    }
+
+    [Fact]
+    public void HookSilenceGapMs_WhenTheHeartbeatIsFresherThanTheLastInput_IsNegative()
+    {
+        // What a live hook looks like: the callback ran more recently than the input Windows
+        // recorded. Negative is a healthy reading, not an error, and the log prints it as-is.
+        var gap = PhysicalIdle.HookSilenceGapMs(systemIdleMs: 5_000, lastCallbackMs: NowMs - 100, nowMs: NowMs);
+
+        Assert.True(gap < 0, $"Expected a negative gap for a hook that just fired, got {gap}.");
+    }
+
+    [Theory]
+    [InlineData(10_000)]
+    [InlineData(120_000)]
+    public void HookSilenceGapMs_WhenTheIdleClockIsPinnedAtZero_CollapsesToTheCallbackAge(long callbackAgeMs)
+    {
+        // THE DEGENERATION, pinned so nobody has to rediscover it. On a machine whose idle
+        // clock never rises -- 239 resets in 150 s on the box that found this -- systemIdleMs
+        // is ~0 and the gap IS the callback age. The two-clock cross-check has silently become
+        // a one-clock liveness timeout.
+        //
+        // This is also the proof that "require the gap to be GROWING" cannot rescue it, which
+        // is the first idea every reader has. A genuinely dropped hook and a merely quiet one
+        // both produce exactly this number, growing at one tick per tick. They are not
+        // distinguishable from these two clocks at all; only elapsed time separates them.
+        Assert.Equal(callbackAgeMs, PhysicalIdle.HookSilenceGapMs(0, NowMs - callbackAgeMs, NowMs));
+    }
+
+    [Theory]
+    [InlineData(0L, "0ms")]
+    [InlineData(999L, "999ms")]
+    [InlineData(-250L, "-250ms")]
+    [InlineData(1_000L, "1.0s")]
+    [InlineData(120_000L, "120.0s")]
+    [InlineData(-10_500L, "-10.5s")]
+    [InlineData(long.MinValue, "unavailable")]
+    public void FormatMs_RendersEveryCaseTheIncidentLogCanProduce(long valueMs, string expected)
+    {
+        // long.MinValue is the "no cross-check" sentinel and must become a word: printing
+        // "-9223372036854775808ms" in the one line a human reads to decide whether their
+        // hooks are broken is worse than printing nothing.
+        //
+        // Negatives are ordinary and must survive: a negative clock gap is a HEALTHY hook,
+        // and rounding it away or rejecting it would hide the most reassuring reading there is.
+        Assert.Equal(expected, PhysicalIdle.FormatMs(valueMs));
+    }
+
+    [Fact]
+    public void FormatMs_UsesInvariantCulture()
+    {
+        // The same omission in LogCleanupOutcome was a real finding in this repo. On a
+        // comma-decimal machine an un-invariant format writes "1,5s", and the diagnostic this
+        // whole change exists to add becomes unparseable exactly where it is needed.
+        var original = Thread.CurrentThread.CurrentCulture;
+        try
+        {
+            Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo("de-DE");
+            Assert.Equal("1.5s", PhysicalIdle.FormatMs(1_500));
+        }
+        finally
+        {
+            Thread.CurrentThread.CurrentCulture = original;
+        }
+    }
+
     // Arranges the two clock readings the way a tick would see them: the system last saw
     // input `systemIdleMs` ago, and Windows last called a hook callback `callbackAgeMs` ago.
     private static bool Suspect(
