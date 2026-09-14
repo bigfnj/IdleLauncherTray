@@ -43,6 +43,11 @@ These require a Windows desktop session and user interaction:
 - Sleep the machine, wake it, and confirm the log records `Resumed from sleep; idle clock reset` and that the tooltip restarts its idle count from near zero. Without this the suspended hours count as idle and the target can launch before you have touched anything.
 - Corrupt `%APPDATA%\IdleLauncherTray\config.json` (truncate it mid-object) while the app is closed, then start it. Confirm a `config.corrupt-<timestamp>.json` appears beside it holding the original text, that the app starts on defaults, and that the original is **not** left to be overwritten.
 - Toggle **Run at startup** on and off; confirm the HKCU Run entry points to the current portable executable path and is removed when disabled.
+- Write the `HKCU\...\Run\IdleLauncherTray` value by hand through a differently-cased or 8.3 short path, reopen the tray, and confirm **Run at startup** shows **ticked**. It used to show unticked while the app launched at every logon, with no way to clear it from the menu.
+- Set the target to a path containing an environment variable (for example `%WINDIR%\System32\notepad.exe`). Confirm **Run Now** launches it, and that after a restart `config.json` still contains `%WINDIR%` rather than the expanded path.
+- Open **Application -> Set arguments...**, then click another application's window. Confirm the prompt stays on top, has a taskbar button and an Alt-Tab entry, and that OK and Cancel both return control to the tray.
+- After **Uninstall**, open `%TEMP%\IdleLauncherTray-uninstall.log` and confirm the newest entry records `ParentExited=True`. That value can genuinely be False, which is the point of logging it.
+- Confirm the uninstall menu click returns promptly. The tray icon vanishing should be the last visible event, not the start of a multi-second freeze.
 - Use **Uninstall (remove settings + startup)**; confirm `%APPDATA%\IdleLauncherTray` settings are removed, startup registration is removed, and the portable executable remains in place.
 
 ## Release artifact check

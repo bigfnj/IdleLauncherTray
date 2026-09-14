@@ -23,6 +23,46 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## v2.7 highlights
+
+Version 2.7 works down the defect list the v2.6 audits produced. Two of the items were the same
+shape as the bug v2.5 was written to fix: a guard that was correct where it was written, and
+defeated one level up the call stack.
+
+- **The CPU guard stopped guarding while a target was running.** The CPU sampler measures the span
+  since the last time it was asked, so it has to be asked every tick. It sat below the "is the
+  target still running?" early return, which means that for the whole duration of a run it was
+  never asked at all. After a four-hour screensaver the next reading was a four-hour average, which
+  passes any threshold, at exactly the moment the app decides whether to launch again.
+- **Your target path is no longer rewritten.** If you type `%APPDATA%\tools\app.exe`, that is what
+  stays in `config.json`. Previously the app expanded it to a full path and wrote that back on the
+  first save, which quietly destroyed the portable setup this app is designed for, and destroyed
+  any path with a literal `%` in it.
+- **A path Windows cannot parse is no longer reported as an unsupported file type.** It used to say
+  your `.exe` was the wrong kind of file, show you a list of supported types that included `.exe`,
+  and then delete your setting. The two faults are now told apart, and an unparseable path is kept
+  rather than cleared, because with portable paths whether something parses depends on which
+  machine is reading it.
+- **"Run at startup" no longer says OFF while the app starts at every logon.** A Run entry written
+  through a short (8.3) path, a junction or a symlink failed an exact path comparison, so the tray
+  reported it as disabled and offered no way to turn it off.
+- **Saving your settings is now durable, not just atomic.** The rename could never tear, but nothing
+  forced the bytes to disk first, so a power cut could publish a complete rename over an incomplete
+  file.
+- **Uninstall no longer freezes the tray for up to eight seconds** after the icon has already
+  disappeared, and it now records whether the app had actually exited when a cleanup failed, which
+  is the difference between "something else is holding your files" and "we did not wait long
+  enough".
+- **The log says when it rotated.** Previously a rotated log began mid-sentence with nothing to say
+  so, in an app whose entire diagnostic surface is that file.
+- **The arguments prompt can no longer hide behind other windows**, where it was both invisible and
+  blocking, with no taskbar button or Alt-Tab entry to find it by.
+- **A stuck CPU sampler now says why.** It already reported that it was stuck; the underlying
+  Windows error was discarded. A stuck sampler means the app never launches anything.
+- **A second, different fault now raises its own notification.** The five-minute quiet period after
+  a warning was applied to every fault rather than per fault, so a new problem arriving shortly
+  after an old one cleared was logged and never shown.
+
 ## v2.6.1 highlights
 
 A post-release audit of the v2.6.0 code found that the new degraded warning **fired on ordinary

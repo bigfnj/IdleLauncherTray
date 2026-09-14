@@ -251,12 +251,23 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 
 ## Version
 
-Current version: **2.6.1**
+Current version: **2.7.0**
 
 The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.csproj`. The release
 workflow derives the shipped assembly version from the git tag instead, so a tagged build always
 matches its tag regardless of what the csproj says.
 
+- **v2.7** — works down the defect list the v2.6 audits produced. Two items were the same shape as
+  the bug v2.5 fixed: a guard correct where it was written and defeated one level up the call
+  stack. The CPU delta sampler sat below `OnTick`'s running-target early return, so it was frozen
+  for the whole duration of a run; and `NormalizeInPlace` wrote the environment-expanded path back
+  into the config, baking a portable setup to one machine. The launch decision became a pure
+  function (`LaunchDecision`), which is what finally made the v2.5.0 correctness fixes testable.
+  Also: a lock closes the hook-liveness read-modify-write race; the startup checkbox stops
+  reporting OFF while the app launches at logon; the config write became durable rather than only
+  atomic; `AppPaths.DefaultBaseDir` is rooted so a broken shell API cannot point a recursive delete
+  at the current directory; log rotation leaves a marker; and `PhysicalIdle` was narrowed to
+  `internal`, making it true for the first time that the assembly exports no public types.
 - **v2.6.1** — stops the v2.6.0 drop detector crying wolf. Hook silence is now declared *expected*
   while the session is locked or disconnected (`PhysicalIdle.SetHookSilenceExpected`), because
   secure-desktop input never reaches a default-desktop hook but does keep refreshing
