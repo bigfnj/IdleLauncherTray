@@ -20,6 +20,9 @@ internal sealed class CpuUsageMonitorProxy
     private static readonly MethodInfo TryNextValueMethod = Product.MethodNamed("CpuUsageMonitor", "TryNextValue");
     private static readonly MethodInfo ToUInt64Method = Product.MethodNamed("CpuUsageMonitor", "ToUInt64");
 
+    private static readonly MethodInfo DescribeLastSampleFailureMethod =
+        Product.MethodNamed("CpuUsageMonitor", "DescribeLastSampleFailure");
+
     private static readonly Type FileTimeType =
         MonitorType.GetNestedType("FILETIME", BindingFlags.NonPublic)
         ?? throw new MissingMemberException(MonitorType.FullName, "FILETIME");
@@ -39,6 +42,25 @@ internal sealed class CpuUsageMonitorProxy
         get => (bool)Product.FieldNamed(MonitorType, "_initialized").GetValue(_instance)!;
         set => Product.FieldNamed(MonitorType, "_initialized").SetValue(_instance, value);
     }
+
+    /// <summary>
+    /// The recorded Win32 error from the last <c>GetSystemTimes</c> call, or null when it
+    /// succeeded. Boxed as a plain <c>int</c> by reflection when it has a value, so the cast
+    /// goes through <c>int?</c> rather than a direct unbox.
+    /// </summary>
+    internal int? LastSampleError =>
+        (int?)Product.PropertyNamed("CpuUsageMonitor", nameof(LastSampleError)).GetValue(_instance);
+
+    internal string DescribeLastSampleFailure() =>
+        (string)Product.Call(DescribeLastSampleFailureMethod, _instance)!;
+
+    /// <summary>
+    /// The product's pure classifier. Reached directly because the failure it describes --
+    /// <c>GetSystemTimes</c> itself returning false -- cannot be provoked on a working machine,
+    /// so driving it through an instance would leave two of its three branches untested.
+    /// </summary>
+    internal static string DescribeSampleFailure(int? errorCode) =>
+        (string)Product.CallStatic("CpuUsageMonitor", nameof(DescribeSampleFailure), errorCode)!;
 
     internal ulong PreviousIdle
     {

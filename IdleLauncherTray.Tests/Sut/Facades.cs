@@ -24,6 +24,15 @@ internal static class AppPaths
 
     internal static string LegacyInstalledExePath =>
         Product.ReadStaticProperty<string>(TypeName, nameof(LegacyInstalledExePath));
+
+    /// <summary>
+    /// The product's pure composer for the default data directory. Private, and reached here
+    /// because it is the only part of the default-path logic that can be exercised with inputs:
+    /// the value it normally receives comes from <c>Environment.GetFolderPath</c>, which a test
+    /// cannot make return an empty or malformed path on a healthy machine.
+    /// </summary>
+    internal static string ComposeDefaultBaseDir(string? applicationDataPath) =>
+        (string)Product.CallStatic(TypeName, nameof(ComposeDefaultBaseDir), applicationDataPath)!;
 }
 
 /// <summary>Mirror of the product's <c>IdleLauncherTray.TargetFilePolicy</c>.</summary>
@@ -45,19 +54,57 @@ internal static class TargetFilePolicy
 }
 
 /// <summary>
-/// Mirror of the product's <c>IdleLauncherTray.DeletionHelper</c>. Both members are
-/// <c>private</c> in the product: they are the guard rails around a recursive delete,
-/// so they are deliberately not callable from anywhere else in the app.
+/// Mirror of the product's <c>IdleLauncherTray.DeletionHelper</c>. Every member here is
+/// <c>private</c> in the product: they are the guard rails around a recursive delete, and
+/// the command-line parser that feeds them, so they are deliberately not callable from
+/// anywhere else in the app.
 /// </summary>
 internal static class DeletionHelper
 {
-    private const string TypeName = "DeletionHelper";
+    internal const string TypeName = "DeletionHelper";
 
     internal static bool IsSafeDeleteTarget(string? folderPath) =>
         (bool)Product.CallStatic(TypeName, nameof(IsSafeDeleteTarget), folderPath)!;
 
     internal static string NormalizeFolderPath(string? folderPath) =>
         (string)Product.CallStatic(TypeName, nameof(NormalizeFolderPath), folderPath)!;
+
+    internal static int DeleteRetryDelayMs => Product.ReadConst<int>(TypeName, nameof(DeleteRetryDelayMs));
+
+    internal static int MaxDeleteAttempts => Product.ReadConst<int>(TypeName, nameof(MaxDeleteAttempts));
+
+    internal static int MaxInProcessDeleteAttempts =>
+        Product.ReadConst<int>(TypeName, nameof(MaxInProcessDeleteAttempts));
+
+    internal static string CleanupFolderArg => Product.ReadConst<string>(TypeName, nameof(CleanupFolderArg));
+
+    internal static string CleanupParentPidArg => Product.ReadConst<string>(TypeName, nameof(CleanupParentPidArg));
+
+    /// <summary>
+    /// The product's argument parser. Its two results come back as <c>out</c> parameters, which
+    /// reflection surfaces as slots in the boxed argument array rather than as return values.
+    /// </summary>
+    internal static bool TryParseCleanupArgs(string[] args, out string folderToDelete, out int parentPid)
+    {
+        var arguments = new object?[] { args, string.Empty, 0 };
+        var parsed = (bool)Product.Call(
+            Product.MethodNamed(TypeName, nameof(TryParseCleanupArgs)),
+            target: null,
+            arguments)!;
+
+        folderToDelete = (string)arguments[1]!;
+        parentPid = (int)arguments[2]!;
+        return parsed;
+    }
+
+    internal static bool TryDeleteFolderWithRetries(string folderPath, int maxAttempts) =>
+        (bool)Product.CallStatic(TypeName, nameof(TryDeleteFolderWithRetries), folderPath, maxAttempts)!;
+
+    /// <summary>True if the product still declares a field of that name, whatever its value.</summary>
+    internal static bool DeclaresField(string fieldName) =>
+        Product.TypeNamed(TypeName).GetField(
+            fieldName,
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance) is not null;
 }
 
 /// <summary>Mirror of the product's <c>IdleLauncherTray.ConfigManager</c>.</summary>
@@ -253,6 +300,25 @@ internal static class Logger
     private const string TypeName = "Logger";
 
     internal static string LogPath => Product.ReadStaticProperty<string>(TypeName, nameof(LogPath));
+
+    internal static long MaxLogBytes => Product.ReadConst<long>(TypeName, nameof(MaxLogBytes));
+
+    /// <summary>
+    /// The product's own rotation-marker text, read rather than copied. A test that compared
+    /// against a literal here would keep passing after the product's marker changed or
+    /// disappeared, which is the one thing it exists to notice.
+    /// </summary>
+    internal static string RotationMarkerPrefix => Product.ReadConst<string>(TypeName, nameof(RotationMarkerPrefix));
+
+    /// <summary>
+    /// The parameterised rotation seam. The production entry point (<c>RotateIfNeeded</c>)
+    /// reads <c>_logPath</c>, a <c>static readonly</c> field — and .NET throws
+    /// <c>FieldAccessException</c> from <c>FieldInfo.SetValue</c> on an initonly static, so
+    /// there is no reflection trick that would let a test point it at a temp file. Taking the
+    /// path and the limit as arguments is what makes rotation testable at all.
+    /// </summary>
+    internal static bool TryRotate(string logPath, long maxBytes) =>
+        (bool)Product.CallStatic(TypeName, nameof(TryRotate), logPath, maxBytes)!;
 }
 
 /// <summary>

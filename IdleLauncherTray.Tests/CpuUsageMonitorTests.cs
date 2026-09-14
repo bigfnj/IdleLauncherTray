@@ -1,4 +1,6 @@
 using System;
+using System.ComponentModel;
+using System.Globalization;
 using System.Threading;
 using IdleLauncherTray.Tests.Sut;
 
@@ -161,5 +163,87 @@ public sealed class CpuUsageMonitorTests
         // with the top bit set into 0xFFFFFFFF________ and wreck every delta after it.
         Assert.Equal(0x80000000UL, CpuUsageMonitorProxy.ToUInt64(0u, 0x80000000u));
         Assert.Equal(0xFFFFFFFFUL, CpuUsageMonitorProxy.ToUInt64(0u, 0xFFFFFFFFu));
+    }
+
+    [Fact]
+    public void TryNextValue_OnAReadingThatSucceeds_RecordsNoSampleError()
+    {
+        var monitor = new CpuUsageMonitorProxy();
+        monitor.TryNextValue(out _);
+
+        Thread.Sleep(120);
+
+        Assert.True(monitor.TryNextValue(out _), "A sample taken 120ms later should produce a reading.");
+        Assert.Null(monitor.LastSampleError);
+    }
+
+    [Fact]
+    public void TryNextValue_WhenASampleIsDiscarded_DoesNotReportItAsAPInvokeFailure()
+    {
+        // The distinction the property exists for. A counter regression and a failed
+        // GetSystemTimes both come back as plain `false`, and conflating them would put
+        // "GetSystemTimes failed: ..." into the log of a machine whose counters are fine --
+        // sending whoever reads it to look for a broken kernel call that never happened.
+        var monitor = new CpuUsageMonitorProxy();
+        monitor.TryNextValue(out _);
+
+        monitor.PreviousKernel = ulong.MaxValue;
+        Thread.Sleep(30);
+
+        Assert.False(monitor.TryNextValue(out _), "A sample after a counter regression must be discarded.");
+        Assert.Null(monitor.LastSampleError);
+        Assert.DoesNotContain("failed", monitor.DescribeLastSampleFailure(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TryNextValue_WhilePriming_RecordsNoSampleError()
+    {
+        var monitor = new CpuUsageMonitorProxy();
+
+        Assert.False(monitor.TryNextValue(out _));
+        Assert.Null(monitor.LastSampleError);
+    }
+
+    [Fact]
+    public void DescribeSampleFailure_WithNoRecordedError_SaysTheSampleWasDiscardedRatherThanTheCallFailing()
+    {
+        var description = CpuUsageMonitorProxy.DescribeSampleFailure(null);
+
+        // Null does NOT mean "nothing to report". It means the P/Invoke SUCCEEDED and the
+        // sample was thrown away afterwards -- priming, a counter regression, or a window
+        // shorter than a clock tick. Saying which three is a real diagnosis: a sampler stuck in
+        // priming looks nothing like one whose counters keep going backwards, and they have
+        // different causes and different fixes.
+        Assert.Contains("succeeded", description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("discarded", description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("priming", description, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("failed", description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void DescribeSampleFailure_WithZero_SaysTheCallFailedWithNoWin32ErrorReported()
+    {
+        var description = CpuUsageMonitorProxy.DescribeSampleFailure(0);
+
+        // The call really did fail, Windows just declined to say why. Reporting "Win32 error 0"
+        // would translate to "The operation completed successfully", which is the most
+        // misleading thing a failure log can say.
+        Assert.Contains("no Win32 error", description, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("succeeded", description, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(5)]     // ERROR_ACCESS_DENIED
+    [InlineData(87)]    // ERROR_INVALID_PARAMETER
+    [InlineData(1314)]  // ERROR_PRIVILEGE_NOT_HELD
+    public void DescribeSampleFailure_WithAWin32Code_CarriesBothTheSystemMessageAndTheNumber(int errorCode)
+    {
+        var description = CpuUsageMonitorProxy.DescribeSampleFailure(errorCode);
+
+        // Both halves earn their place: the message is what a human reads, and the number is
+        // what survives a machine whose system messages are localised into a language the
+        // person reading the log does not speak.
+        Assert.Contains(new Win32Exception(errorCode).Message, description, StringComparison.Ordinal);
+        Assert.Contains(errorCode.ToString(CultureInfo.InvariantCulture), description, StringComparison.Ordinal);
     }
 }

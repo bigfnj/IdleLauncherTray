@@ -14,6 +14,31 @@ internal static class TextPrompt
     /// </summary>
     public static bool Show(string title, string message, ref string value)
     {
+        // Deliberately OWNERLESS, despite the obvious-looking fix of passing an owner to
+        // ShowDialog. There are two separate problems here and ownership solves neither:
+        //
+        //   Reachability. The dialog is raised from a tray menu, so there is no window of ours
+        //   for it to sit above -- it opens behind whatever the user was working in. Only
+        //   TopMost fixes z-order against ANOTHER application's windows.
+        //
+        //   Discoverability. Once it is behind something, the user needs a way back to it, and
+        //   that means a taskbar button. Only ShowInTaskbar fixes that.
+        //
+        // The two rejected alternatives, for the next person who reads the backlog entry:
+        //
+        //   ShowDialog(GetForegroundWindow()) hands the z-order AND the lifetime of our modal
+        //   to an HWND owned by a different process. This machine runs entirely over RDP, where
+        //   the session is torn down several times a day; an owner that dies while we are modal
+        //   is exactly the stranded, un-dismissable dialog this is meant to prevent.
+        //
+        //   A hidden owner form makes discoverability strictly WORSE. An owned window without
+        //   WS_EX_APPWINDOW gets no taskbar button at all, and Alt-Tab lists the OWNER instead
+        //   of the owned window -- and our owner would be the hidden one. The dialog would then
+        //   be reachable by neither route.
+        //
+        // Manual smoke test only: every claim above is about window-manager behaviour, and a
+        // test that asserts TopMost == true after the line that sets TopMost = true proves
+        // nothing except that assignment works.
         using var form = new Form
         {
             Text = title,
@@ -21,7 +46,8 @@ internal static class TextPrompt
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
             MaximizeBox = false,
-            ShowInTaskbar = false,
+            TopMost = true,
+            ShowInTaskbar = true,
             AutoScaleMode = AutoScaleMode.Font,
             ClientSize = new Size(560, 155)
         };
@@ -78,6 +104,11 @@ internal static class TextPrompt
         {
             try
             {
+                // TopMost puts the window in front; it does not give it the keyboard. Activate
+                // must come first, because Focus() on a control of an inactive form sets the
+                // form's internal "active control" and nothing else -- the user would be typing
+                // into whatever app still held focus.
+                form.Activate();
                 tb.Focus();
                 tb.SelectAll();
             }

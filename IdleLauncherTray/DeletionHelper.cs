@@ -10,10 +10,30 @@ internal static class DeletionHelper
 {
     private const string CleanupFolderArg = "--cleanup-folder";
     private const string CleanupParentPidArg = "--cleanup-parent-pid";
-    private const string CleanupWaitMsArg = "--cleanup-wait-ms";
 
-    private const int DefaultInitialWaitMs = 2000;
+    // How long the cleanup CHILD waits for the tray process that spawned it to exit before
+    // trying the delete. Exactly one meaning now that the in-process paths no longer sleep:
+    // there is no "initial wait" any more, only this.
+    private const int ParentExitWaitMs = 2000;
+
+    // The child process gets the generous budget: it has already outlived the tray, nothing
+    // is waiting on it, and its whole job is to keep trying.
     private const int MaxDeleteAttempts = 12;
+
+    // The three in-process fallback paths get three. They run SYNCHRONOUSLY ON THE UI THREAD
+    // from the uninstall handler, after ShutdownForExit has hidden the tray icon -- so every
+    // retry is time the user spends staring at a tray where the icon just vanished and nothing
+    // else happened. Twelve attempts x 500ms is eight seconds of that.
+    //
+    // Three is not a guess about how long a lock lasts. At that moment the tray holds NOTHING
+    // inside BaseDir: the log is written with File.AppendAllText, which opens and closes per
+    // line, and the custom tray icon was read into a MemoryStream at load. So the only thing a
+    // retry can outlast is a THIRD-PARTY transient -- antivirus, the search indexer, a shell
+    // preview handler -- and if one of those is still holding a handle a second later, the
+    // deferred child (which is not on any UI thread and has the full twelve) is the right
+    // place for that fight, not here.
+    private const int MaxInProcessDeleteAttempts = 3;
+
     private const int DeleteRetryDelayMs = 500;
 
     public static void ScheduleFolderDelete(string folderToDelete)
@@ -27,7 +47,7 @@ internal static class DeletionHelper
         var helperExePath = AppPaths.CurrentExePath;
         if (string.IsNullOrWhiteSpace(helperExePath) || !File.Exists(helperExePath))
         {
-            TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: DefaultInitialWaitMs);
+            TryDeleteFolderWithRetries(normalizedFolder, MaxInProcessDeleteAttempts);
             return;
         }
 
@@ -43,8 +63,6 @@ internal static class DeletionHelper
         psi.ArgumentList.Add(normalizedFolder);
         psi.ArgumentList.Add(CleanupParentPidArg);
         psi.ArgumentList.Add(Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
-        psi.ArgumentList.Add(CleanupWaitMsArg);
-        psi.ArgumentList.Add(DefaultInitialWaitMs.ToString(CultureInfo.InvariantCulture));
 
         try
         {
@@ -60,28 +78,28 @@ internal static class DeletionHelper
             else
             {
                 Logger.Warn($"Process.Start returned null when spawning cleanup helper for '{normalizedFolder}'. Falling back to in-process deletion.");
-                TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: DefaultInitialWaitMs);
+                TryDeleteFolderWithRetries(normalizedFolder, MaxInProcessDeleteAttempts);
             }
         }
         catch (Exception ex)
         {
             Logger.Warn($"Failed to start deferred cleanup helper for '{normalizedFolder}'. Falling back to an in-process deletion attempt. Error='{ex.Message}'.");
-            TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: DefaultInitialWaitMs);
+            TryDeleteFolderWithRetries(normalizedFolder, MaxInProcessDeleteAttempts);
         }
     }
 
     public static bool TryRunCleanupFromCommandLine(string[] args)
     {
-        if (!TryParseCleanupArgs(args, out var folderToDelete, out var parentPid, out var initialWaitMs))
+        if (!TryParseCleanupArgs(args, out var folderToDelete, out var parentPid))
         {
             return false;
         }
 
-        RunCleanupWorker(folderToDelete, parentPid, initialWaitMs);
+        RunCleanupWorker(folderToDelete, parentPid);
         return true;
     }
 
-    private static void RunCleanupWorker(string folderToDelete, int parentPid, int initialWaitMs)
+    private static void RunCleanupWorker(string folderToDelete, int parentPid)
     {
         var normalizedFolder = NormalizeFolderPath(folderToDelete);
         if (!IsSafeDeleteTarget(normalizedFolder))
@@ -90,22 +108,37 @@ internal static class DeletionHelper
             return;
         }
 
-        WaitForParentExit(parentPid, initialWaitMs);
+        var parentExited = WaitForParentExit(parentPid);
 
         // Log the outcome so a silent failure (locked file, permission denied)
         // shows up in the log instead of vanishing — note that this log entry
         // is written *after* the parent has exited, so it lands in the same
         // log file the user will inspect post-uninstall.
-        var deleted = TryDeleteFolderWithRetries(normalizedFolder, initialWaitMs: 0);
+        var deleted = TryDeleteFolderWithRetries(normalizedFolder, MaxDeleteAttempts);
 
         // Deliberately NOT Logger. Logger.EnsureDirectoryExists calls Directory.CreateDirectory
         // on AppPaths.BaseDir, and its _dirCreated cache is false in this fresh child process --
         // so logging the successful delete RECREATED the very folder we had just removed and
         // wrote a new log file into it. Uninstall therefore never left a clean state. Write the
         // outcome outside the deleted tree instead, so it is still diagnosable.
-        LogCleanupOutcome(deleted
-            ? $"Deferred cleanup completed. Folder='{normalizedFolder}'."
-            : $"Deferred cleanup did not fully delete the folder after {MaxDeleteAttempts} attempts. Folder='{normalizedFolder}'.");
+        if (deleted)
+        {
+            LogCleanupOutcome($"Deferred cleanup completed. Folder='{normalizedFolder}' ParentExited={parentExited}.");
+            return;
+        }
+
+        // The parent-exit outcome is carried down to here because this file is the ONLY thing a
+        // user has after an uninstall, and "it failed" is not a diagnosis. If the parent never
+        // exited, the tray process still had the folder open and no number of retries was ever
+        // going to win -- a completely different problem, with a completely different fix, from
+        // a third party holding a handle.
+        var cause = parentExited
+            ? "the parent process had already exited, so something else is holding files in the folder (antivirus, the search indexer, a shell preview handler, or an open Explorer window)."
+            : $"the parent process was NOT observed to exit within {ParentExitWaitMs.ToString(CultureInfo.InvariantCulture)}ms, so it most likely still had the folder open and no number of retries would have succeeded.";
+
+        LogCleanupOutcome(
+            $"Deferred cleanup did not fully delete the folder after {MaxDeleteAttempts.ToString(CultureInfo.InvariantCulture)} attempts. "
+            + $"Folder='{normalizedFolder}' ParentExited={parentExited}. Cause: {cause}");
     }
 
     // Uninstall outcome goes to %TEMP%, never to AppPaths.BaseDir -- that folder is what we
@@ -116,9 +149,14 @@ internal static class DeletionHelper
         try
         {
             var path = Path.Combine(Path.GetTempPath(), "IdleLauncherTray-uninstall.log");
+
+            // InvariantCulture, like every other timestamp this app writes (see Logger.FormatLine).
+            // Without it the format string is interpreted against the current culture, and under
+            // ja-JP or ar-SA both the calendar era-year and the digit glyphs change -- in the ONE
+            // file a user has left to read after uninstalling.
             File.AppendAllText(
                 path,
-                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}");
+                $"{DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)} {message}{Environment.NewLine}");
         }
         catch
         {
@@ -126,47 +164,70 @@ internal static class DeletionHelper
         }
     }
 
-    private static void WaitForParentExit(int parentPid, int fallbackWaitMs)
+    /// <summary>
+    /// Returns whether the parent was actually OBSERVED to exit. That distinction is the whole
+    /// value of the return: the caller writes it into the uninstall log, where "we waited and it
+    /// was still running" and "it was gone" point at entirely different causes for a failed
+    /// delete.
+    /// <para>
+    /// PID reuse is a known and deliberately unhandled hazard: between the parent recording its
+    /// own id and this lookup, Windows could in principle have recycled that id onto an
+    /// unrelated process, and we would then wait on a stranger. A handshake (an inherited event
+    /// handle, or a start-time check passed down) would close it. It is not worth it. The window
+    /// is milliseconds wide, the worst case is that we wait up to <see cref="ParentExitWaitMs"/>
+    /// longer and then delete anyway, the delete target is independently guarded by
+    /// <see cref="IsSafeDeleteTarget"/> regardless of what we waited on, and the fix would add a
+    /// third argument to the very command-line surface this change just shrank.
+    /// </para>
+    /// </summary>
+    private static bool WaitForParentExit(int parentPid)
     {
         if (parentPid > 0)
         {
             try
             {
                 using var parent = Process.GetProcessById(parentPid);
-                if (!parent.HasExited)
-                {
-                    var waitMs = Math.Max(fallbackWaitMs, DefaultInitialWaitMs);
-                    parent.WaitForExit(waitMs);
-                }
-
-                return;
+                return parent.HasExited || parent.WaitForExit(ParentExitWaitMs);
             }
             catch (ArgumentException)
             {
-                return;
+                // GetProcessById throws this when nothing is running under that id, which is
+                // precisely the state we were waiting for. It exited; we just missed it.
+                return true;
             }
             catch
             {
-                // Fall back to a bounded sleep below.
+                // Anything else (access denied on HasExited, for instance) tells us nothing
+                // about the parent. Fall through to the bounded sleep below.
             }
         }
 
-        if (fallbackWaitMs > 0)
-        {
-            Thread.Sleep(fallbackWaitMs);
-        }
+        // We did NOT observe an exit here, so say so. Reporting true because we slept for the
+        // same duration would be a log line that cannot fail -- it would read identically
+        // whether the parent had gone or was still holding every file in the folder.
+        Thread.Sleep(ParentExitWaitMs);
+        return false;
     }
 
-    private static bool TryParseCleanupArgs(string[] args, out string folderToDelete, out int parentPid, out int initialWaitMs)
+    /// <summary>
+    /// Total over every possible <paramref name="args"/>: each branch independently checks that
+    /// a value follows its flag, all out-params are assigned up front, and the final check is
+    /// what decides success.
+    /// <para>
+    /// There is deliberately no <c>args.Length &lt; 2</c> fast path. It was removed because it
+    /// was a provable no-op across the entire input domain -- the loop cannot read past the end
+    /// with or without it, and the closing
+    /// <c>!string.IsNullOrWhiteSpace(folderToDelete)</c> already returns false for every input
+    /// too short to contain a flag and its value. Keeping it did active harm: it implied the
+    /// loop below depends on a minimum length, which it does not. (This is not the same as the
+    /// guards that keep a function TOTAL and must stay even when no current caller reaches
+    /// them; this one changed nothing for any input at all.)
+    /// </para>
+    /// </summary>
+    private static bool TryParseCleanupArgs(string[] args, out string folderToDelete, out int parentPid)
     {
         folderToDelete = string.Empty;
         parentPid = 0;
-        initialWaitMs = DefaultInitialWaitMs;
-
-        if (args.Length < 2)
-        {
-            return false;
-        }
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -182,16 +243,6 @@ internal static class DeletionHelper
                 if (int.TryParse(args[++i], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedPid) && parsedPid > 0)
                 {
                     parentPid = parsedPid;
-                }
-
-                continue;
-            }
-
-            if (string.Equals(arg, CleanupWaitMsArg, StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-            {
-                if (int.TryParse(args[++i], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedWaitMs) && parsedWaitMs >= 0)
-                {
-                    initialWaitMs = parsedWaitMs;
                 }
             }
         }
@@ -292,23 +343,47 @@ internal static class DeletionHelper
         }
     }
 
-    private static bool TryDeleteFolderWithRetries(string folderPath, int initialWaitMs)
+    /// <summary>
+    /// Deletes <paramref name="folderPath"/>, retrying up to <paramref name="maxAttempts"/>
+    /// times with <see cref="DeleteRetryDelayMs"/> between attempts.
+    /// <para>
+    /// There is no "wait before the first attempt" parameter any more. It existed so the
+    /// deferred CHILD could let the tray process exit first, and the only caller that ever
+    /// passed a non-zero value was an in-process fallback -- where we ARE the parent, so
+    /// sleeping to wait for ourselves cannot help by construction and the two seconds bought
+    /// nothing but an emptier tray. The child's wait now lives in <see cref="WaitForParentExit"/>,
+    /// which is the only place it ever meant anything.
+    /// </para>
+    /// </summary>
+    private static bool TryDeleteFolderWithRetries(string folderPath, int maxAttempts)
     {
-        if (initialWaitMs > 0)
+        if (!Directory.Exists(folderPath))
         {
-            Thread.Sleep(initialWaitMs);
+            return true;
         }
 
-        for (var attempt = 0; attempt < MaxDeleteAttempts; attempt++)
+        // Hoisted OUT of the retry loop. Nothing inside the loop can put a ReadOnly bit back --
+        // we are the only writer, and a failed Directory.Delete does not restore attributes --
+        // so re-running it per attempt re-walked the entire tree and re-issued one
+        // File.SetAttributes per entry for a result that the first walk had already settled. On
+        // a contended folder that is twelve full recursive enumerations plus 12xN syscalls, all
+        // to discover the same thing twelve times.
+        ClearReadOnlyAttributes(folderPath);
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             try
             {
+                // Still checked inside the loop, and it is NOT a duplicate of the early return
+                // above: this one is the SUCCESS test. Between two attempts the folder can go
+                // away -- a previous Directory.Delete that reported an error may have completed,
+                // or the deferred child may have won the race -- and that is the outcome we
+                // want to report as a success rather than retry against.
                 if (!Directory.Exists(folderPath))
                 {
                     return true;
                 }
 
-                ClearReadOnlyAttributes(folderPath);
                 Directory.Delete(folderPath, recursive: true);
 
                 if (!Directory.Exists(folderPath))
@@ -329,7 +404,13 @@ internal static class DeletionHelper
                 // Give other transient errors one more chance via the retry loop.
             }
 
-            Thread.Sleep(DeleteRetryDelayMs);
+            // No sleep after the LAST attempt. The delay exists to give whatever holds the
+            // folder time to let go before we try again; once there is no "again", it is pure
+            // dead time -- 500ms of it on the UI thread on every failed in-process uninstall.
+            if (attempt < maxAttempts - 1)
+            {
+                Thread.Sleep(DeleteRetryDelayMs);
+            }
         }
 
         return !Directory.Exists(folderPath);
