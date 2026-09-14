@@ -76,6 +76,10 @@ internal sealed class TrayAppContext : ApplicationContext
     // tooltip reports as a degradation rather than letting the gate quietly not enforce anything.
     private bool _sessionSwitchSubscribed;
 
+    // Type+message of the tick failure currently being suppressed, or null when the tick is
+    // healthy. UI thread only.
+    private string? _lastTickFailureSignature;
+
     // Menu items we need to update dynamically
     private readonly ToolStripMenuItem _miStartup;
     private readonly ToolStripMenuItem _miSelected;
@@ -1020,6 +1024,13 @@ internal sealed class TrayAppContext : ApplicationContext
                 case SessionSwitchReason.SessionLock:
                 case SessionSwitchReason.ConsoleDisconnect:
                 case SessionSwitchReason.RemoteDisconnect:
+                    // Excuse hook silence BEFORE raising our own flag, so no tick can observe
+                    // "locked" while the drop detector is still treating silence as evidence.
+                    // Without this an ordinary lock produces a false "input hooks stopped
+                    // firing": secure-desktop input never reaches our hooks but does keep
+                    // refreshing GetLastInputInfo, so touching the lock screen jumps the gap
+                    // between the two clocks to the full lock duration.
+                    PhysicalIdle.SetHookSilenceExpected(true);
                     _workstationLocked = true;
                     Logger.Info($"Session became unavailable; automatic launching is now blocked. Reason={e.Reason}.");
                     break;
@@ -1040,6 +1051,12 @@ internal sealed class TrayAppContext : ApplicationContext
                     // app would report a degraded hook after every unlock.
                     PhysicalIdle.NotifyExternalActivity($"session became available ({e.Reason})");
                     _workstationLocked = false;
+
+                    // Stop excusing hook silence only AFTER the clock and the flag are correct.
+                    // Reversed, a tick could land while silence was still excused but the
+                    // launcher was already unblocked, and a genuinely dead hook would go
+                    // unreported for that window.
+                    PhysicalIdle.SetHookSilenceExpected(false);
                     Logger.Info($"Session became available; automatic launching is allowed again. Reason={e.Reason}.");
                     break;
 
@@ -1129,6 +1146,9 @@ internal sealed class TrayAppContext : ApplicationContext
 
     private void OnTick()
     {
+        // `finally` rather than a statement at the end of the try: two of the three exits from
+        // this method are early returns, and a finally still runs for those.
+        var tickThrew = false;
         try
         {
             PhysicalIdle.TryRepairHooksIfNeeded();
@@ -1184,10 +1204,15 @@ internal sealed class TrayAppContext : ApplicationContext
             // condition would evaluate false on a ready tick, the `else` below would run, and
             // _consecutiveNonIdleTicks would be reset on a tick that never used to touch it.
             //
-            // `evaluation.IdleMeasured &&` is load-bearing: without it the three early-return
-            // paths (no target / unsupported / missing) satisfy `!InputIdleOk` by never having
+            // `evaluation.IdleMeasured &&` is a belt-and-braces guard, and is currently always
+            // true -- EvaluateLaunchReadiness sets it above every early return. Read that as the
+            // reason to keep it, not to drop it: the v2.5.0 bug was that the three early-return
+            // paths (no target / unsupported / missing) satisfied `!InputIdleOk` by never having
             // computed it, so a target on a flaky share re-armed the launcher every other tick
-            // while the user was away, and logged that fresh user activity had been observed.
+            // while the user was away and logged that fresh user activity had been observed. The
+            // actual fix was hoisting the idle sample above those returns; this flag is what
+            // makes re-introducing an early return above that sample fail closed instead of
+            // silently restoring the bug.
             else if (!_armed && evaluation.IdleMeasured && !evaluation.InputIdleOk)
             {
                 // Require at least 2 consecutive non-idle ticks to confirm genuine user activity
@@ -1226,7 +1251,18 @@ internal sealed class TrayAppContext : ApplicationContext
         }
         catch (Exception ex)
         {
-            Logger.Error("Unhandled exception in monitor tick.", ex);
+            // Log the first failure of an episode with its stack trace, then go quiet until the
+            // tick recovers. A permanently failing tick fires every 5 s, and logging each one
+            // unconditionally writes ~17,000 entries a day into a 2 MB file that rotates -- which
+            // would destroy the very stack trace being reported. The recovery is announced too,
+            // so a reader can tell "it stopped failing" from "it stopped logging".
+            tickThrew = true;
+            var signature = ex.GetType().FullName + "|" + ex.Message;
+            if (!string.Equals(_lastTickFailureSignature, signature, StringComparison.Ordinal))
+            {
+                _lastTickFailureSignature = signature;
+                Logger.Error("Unhandled exception in monitor tick. Further identical failures will not be logged until it recovers.", ex);
+            }
 
             // Tooltip call site 3 of 3. A tick that throws is the one failure the user has no
             // other way to notice: the launcher simply stops launching. Its own try/catch because
@@ -1240,6 +1276,14 @@ internal sealed class TrayAppContext : ApplicationContext
             {
                 // The tick has already failed and the tooltip is cosmetic; the original error is
                 // logged above, which is the part that matters.
+            }
+        }
+        finally
+        {
+            if (!tickThrew && _lastTickFailureSignature != null)
+            {
+                _lastTickFailureSignature = null;
+                Logger.Info("Monitor tick recovered; readiness evaluation is running normally again.");
             }
         }
     }

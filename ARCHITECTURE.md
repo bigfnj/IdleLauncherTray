@@ -219,12 +219,18 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 
 ## Version
 
-Current version: **2.6.0**
+Current version: **2.6.1**
 
 The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.csproj`. The release
 workflow derives the shipped assembly version from the git tag instead, so a tagged build always
 matches its tag regardless of what the csproj says.
 
+- **v2.6.1** — stops the v2.6.0 drop detector crying wolf. Hook silence is now declared *expected*
+  while the session is locked or disconnected (`PhysicalIdle.SetHookSilenceExpected`), because
+  secure-desktop input never reaches a default-desktop hook but does keep refreshing
+  `GetLastInputInfo`, so any lock-screen touch made the two clocks disagree by the whole lock
+  duration. Also dedupes the monitor-tick failure log, which otherwise rotated away its own stack
+  trace, and makes both `GetIdleMilliseconds` clock syncs advance-only.
 - **v2.6** — self-reporting pass. v2.5 fixed the ways the app could silently stop working; v2.6
   makes it say so. The tray tooltip now carries the live reason code and a `DEGRADED -` prefix
   when something is broken rather than merely waiting. Adds session-lock gating so an armed

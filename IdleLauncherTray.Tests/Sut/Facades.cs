@@ -126,6 +126,13 @@ internal static class PhysicalIdle
     internal static void NotifyExternalActivity(string? reason) =>
         Product.CallStatic(TypeName, nameof(NotifyExternalActivity), reason);
 
+    internal static void SetHookSilenceExpected(bool expected) =>
+        Product.CallStatic(TypeName, nameof(SetHookSilenceExpected), expected);
+
+    /// <summary>Drives one tick of the detector. Private in the product; reads only clocks.</summary>
+    internal static void UpdateHookLivenessState() =>
+        Product.CallStatic(TypeName, nameof(UpdateHookLivenessState));
+
     /// <summary>
     /// Invokes the real keyboard hook callback with <c>nCode &lt; 0</c>, which is the
     /// "pass this straight through" case: the product must not dereference

@@ -262,6 +262,11 @@ public static class PhysicalIdle
     // a Volatile.Read.
     private static int _hookDropSuspected;
 
+    // Set by the tray while the workstation is locked or the session is disconnected. Written
+    // on the SystemEvents notification thread, read on the tick; single writer, single reader,
+    // no compound invariant, so volatile is sufficient.
+    private static volatile bool _hookSilenceExpected;
+
     // The reason string last handed to the log, so an episode is announced once instead of
     // every 5 s. Only ever touched from the tick, which is single-threaded with itself.
     private static string? _loggedDegradationReason;
@@ -764,6 +769,25 @@ public static class PhysicalIdle
     // belongs on a path that blocks all system input until it returns.
     private static void UpdateHookLivenessState()
     {
+        // While the workstation is locked, hook silence is EXPECTED, not evidence. Input on the
+        // secure desktop never reaches a default-desktop hook, but it does keep refreshing
+        // GetLastInputInfo -- so the moment someone touches the lock screen, the gap between the
+        // two clocks jumps to the full lock duration and, by design, does not shrink again. Three
+        // ticks later the detector would latch and the tray would report "input hooks stopped
+        // firing" for a machine whose hooks are perfectly healthy.
+        //
+        // Clearing on unlock (which NotifyExternalActivity does) only cleans up AFTER the false
+        // alarm has already been logged and ballooned. A warning that fires on every lock cycle is
+        // a warning the user learns to ignore, which would cost this feature the only thing it is
+        // for. So refuse to gather evidence in the first place, and reset what is there.
+        if (_hookSilenceExpected)
+        {
+            Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+            Interlocked.Exchange(ref _hookDropSuspected, 0);
+            LogDegradationTransition();
+            return;
+        }
+
         // One clock sample for both readings: taking nowMs twice would let the two ages be
         // measured against different instants and invent a gap out of nothing.
         var nowMs = GetMonotonicMilliseconds();
@@ -850,6 +874,32 @@ public static class PhysicalIdle
         }
 
         return dropSuspected ? ReasonHooksStoppedFiring : null;
+    }
+
+    /// <summary>
+    /// Declares that our hooks are legitimately not going to be called for a while, because the
+    /// workstation is locked or the session is disconnected, so that silence stops counting as
+    /// evidence of a dropped hook.
+    /// </summary>
+    public static void SetHookSilenceExpected(bool expected)
+    {
+        // Tells the drop detector that our hooks are legitimately not going to be called for a
+        // while -- the workstation is locked, or the session is disconnected -- so that silence
+        // stops being evidence of a fault. Without it an ordinary lock produces a false
+        // "input hooks stopped firing" as soon as anyone touches the lock screen; see the note
+        // in UpdateHookLivenessState.
+        //
+        // Set it BEFORE the caller's own locked flag on the way in and AFTER clearing it on the
+        // way out, so no tick can ever observe "unlocked" while silence is still being excused.
+        _hookSilenceExpected = expected;
+
+        if (expected)
+        {
+            // Drop evidence gathered in the ticks just before the lock event was delivered:
+            // SystemEvents is asynchronous, so the lock has usually already happened.
+            Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+            Interlocked.Exchange(ref _hookDropSuspected, 0);
+        }
     }
 
     /// <summary>
@@ -1121,8 +1171,12 @@ public static class PhysicalIdle
 
             if (sys < phys)
             {
-                var syncedMs = Math.Max(0, nowMs - (long)sys);
-                Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, syncedMs);
+                // Advance-only, like every other write to this field from off the input path:
+                // a bare Exchange can clobber a newer stamp that a hook callback or the gamepad
+                // poll published between our two reads, handing back idle time the user never
+                // accrued. That matters most in the drop-suspected branch, where the value is
+                // not bounded by effectiveWindowMs so the rollback could be arbitrarily large.
+                AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, Math.Max(0, nowMs - (long)sys));
                 return sys;
             }
 
@@ -1138,8 +1192,12 @@ public static class PhysicalIdle
             // from recent inputs that the system saw but hooks also saw correctly).
             if (sys <= effectiveWindowMs && !ShouldIgnoreSystemIdleSample(nowMs, sys, effectiveWindowMs))
             {
-                var syncedMs = Math.Max(0, nowMs - (long)sys);
-                Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, syncedMs);
+                // Advance-only, like every other write to this field from off the input path:
+                // a bare Exchange can clobber a newer stamp that a hook callback or the gamepad
+                // poll published between our two reads, handing back idle time the user never
+                // accrued. That matters most in the drop-suspected branch, where the value is
+                // not bounded by effectiveWindowMs so the rollback could be arbitrarily large.
+                AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, Math.Max(0, nowMs - (long)sys));
                 return sys;
             }
 

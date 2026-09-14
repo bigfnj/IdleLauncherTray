@@ -399,6 +399,57 @@ public sealed class HookLivenessTests
         Assert.False(PhysicalIdle.DropSuspected);
     }
 
+    [Fact]
+    public void SetHookSilenceExpected_WhenTurnedOn_DropsEvidenceGatheredBeforeTheLockEventArrived()
+    {
+        using var hooks = new HookStateScope();
+        try
+        {
+            // SystemEvents delivers the lock notification asynchronously, so ticks between the
+            // real lock and the notification arriving can already have banked evidence.
+            PhysicalIdle.ConsecutiveHookSilenceTicks = PhysicalIdle.HookSilenceTicksRequired;
+            PhysicalIdle.DropSuspected = true;
+
+            PhysicalIdle.SetHookSilenceExpected(true);
+
+            Assert.Equal(0, PhysicalIdle.ConsecutiveHookSilenceTicks);
+            Assert.False(PhysicalIdle.DropSuspected);
+        }
+        finally
+        {
+            PhysicalIdle.SetHookSilenceExpected(false);
+        }
+    }
+
+    [Fact]
+    public void UpdateHookLivenessState_WhileSilenceIsExpected_NeverAccumulatesEvidence()
+    {
+        using var hooks = new HookStateScope();
+        try
+        {
+            // The exact shape of a locked workstation: the heartbeat is frozen hours in the past
+            // because secure-desktop input never reaches a default-desktop hook, while
+            // GetLastInputInfo keeps being refreshed by whoever is standing at the lock screen.
+            // Without the suspension this is precisely the state that latches
+            // "input hooks stopped firing" on a machine whose hooks are perfectly healthy.
+            PhysicalIdle.LastHookCallbackMilliseconds = Environment.TickCount64 - (6L * 60 * 60 * 1000);
+            PhysicalIdle.SetHookSilenceExpected(true);
+
+            for (var tick = 0; tick < PhysicalIdle.HookSilenceTicksRequired + 3; tick++)
+            {
+                PhysicalIdle.UpdateHookLivenessState();
+                Assert.Equal(0, PhysicalIdle.ConsecutiveHookSilenceTicks);
+                Assert.False(PhysicalIdle.DropSuspected);
+            }
+
+            Assert.NotEqual(PhysicalIdle.ReasonHooksStoppedFiring, PhysicalIdle.GetHookDegradationReason());
+        }
+        finally
+        {
+            PhysicalIdle.SetHookSilenceExpected(false);
+        }
+    }
+
     // Arranges the two clock readings the way a tick would see them: the system last saw
     // input `systemIdleMs` ago, and Windows last called a hook callback `callbackAgeMs` ago.
     private static bool Suspect(

@@ -23,6 +23,21 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## v2.6.1 highlights
+
+A post-release audit of the v2.6.0 code found that the new degraded warning **fired on ordinary
+lock cycles**. Input on the lock screen never reaches a low-level hook but does keep refreshing
+Windows' own idle clock, so touching the lock screen made the two clocks disagree by the whole lock
+duration and the detector concluded the hooks had died. It self-corrected on unlock, but only after
+logging a warning and showing a balloon — and a warning that fires every time you unlock your PC is
+a warning you learn to ignore, which would have cost the feature the only thing it is for. Hook
+silence is now *expected* while the session is locked or disconnected, so no false evidence is
+gathered in the first place.
+
+Also fixed: a permanently failing monitor tick logged a full stack trace every 5 seconds, roughly
+17,000 entries a day into a 2 MB log that rotates — destroying the very trace it was reporting. It
+now logs the first failure of an episode and announces the recovery.
+
 ## v2.6 highlights
 
 Version 2.6 finishes what v2.5 started. v2.5 fixed the ways this app could silently stop working;
