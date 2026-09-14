@@ -47,6 +47,10 @@ design decisions worth knowing before changing anything.
   only, hard 63-character cap
 - **LaunchReasonCode.cs**: The closed set of reasons the launcher will or will not fire, so that
   "every rendered status fits" can be proved by enumeration rather than by a list someone maintains
+- **LaunchEvaluation.cs**: One tick's answer to "should the launcher fire, and if not, why not".
+  Lifted out of `TrayAppContext` so it can be produced without a WinForms context in scope
+- **LaunchDecision.cs**: The readiness decision as a pure function. No statics, no clock, no config,
+  no filesystem, no logging: every input is a parameter and the only output is the returned record
 - **DeletionHelper.cs**: Deferred cleanup execution (called from command-line args) for safe uninstall
 - **TextPrompt.cs**: Simple dialog form for user text input (used in menu interactions)
 - **AppPaths.cs**: Centralized path constants and environment-variable expansion utilities
@@ -65,6 +69,34 @@ The state transitions to "ready-to-launch" only when all conditions pass. On suc
 - Process handle is tracked for exit monitoring
 - Workstation lock is applied if enabled (only for idle launches, not manual "Run Now")
 - Re-arming happens after fresh user activity
+
+The decision itself is a **pure function**, `LaunchDecision.Evaluate`, in its own file.
+`EvaluateLaunchReadiness` is now only the sampler that feeds it. That split exists because the
+decision previously lived on a WinForms `ApplicationContext` whose constructor builds a real
+`NotifyIcon`, installs real global input hooks and starts a real timer, so none of it could be
+tested and every correctness fix in it was protected by a comment rather than an assertion.
+
+One consequence is worth knowing before changing it: the cooldown clock-warp repair is **reported**
+by the pure function and applied by the caller, rather than performed in place. The repaired
+timestamp is persisted to `config.json` and survives restart, so it is an explicit output rather
+than a hidden side effect.
+
+### Tick ordering
+
+Two things in `OnTick` are ordering-sensitive and are not obvious from reading it:
+
+**The CPU sample is the first statement**, above the running-target early return and above
+`TryRepairHooksIfNeeded`. `CpuUsageMonitor` is a *delta* sampler: each reading covers the span since
+the previous call, so a tick that skips the sample does not miss one, it silently widens the next.
+Below the running return, the sampler was frozen for the entire run of a launched target. Above
+`TryRepairHooksIfNeeded` because that drains deferred hook logs and can throw out of `Logger`, and a
+failing-tick episode must still advance the sampler.
+
+**The tick rejects re-entry.** `Process.Start` with `UseShellExecute = true` pumps messages, so a
+`WM_TIMER` can re-enter the tick while the outer call is still inside the launch path. Two samples
+inside one timer period halve the window the CPU guard is measured over. The latch is released as
+the *first* statement of the `finally`, before the recovery log, so a throw from `Logger` cannot
+strand it set for the life of the process.
 
 `LaunchEvaluation.Ready` is computed from the booleans alone and never reads `ReasonCode`. A new
 gate therefore has to add a boolean to `Ready` as well as a reason code, or it will label the
