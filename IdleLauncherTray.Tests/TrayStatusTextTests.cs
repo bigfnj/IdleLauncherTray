@@ -16,8 +16,13 @@ namespace IdleLauncherTray.Tests;
 /// </summary>
 public sealed class TrayStatusTextTests
 {
-    private const string AppName = "IdleLauncherTray";
-    private const string Prefix = AppName + ": ";
+    // The tooltip now ends with the configured CPU threshold and the running version, and
+    // carries no app name at all. Every expectation below is "<status>" + Suffix.
+    private const string Suffix = " - CPU 10% - v2.7.0";
+
+    // For the tests that deliberately drive the threshold away from the default.
+    private static string SuffixFor(int cpuThresholdPercent) =>
+        $" - CPU {cpuThresholdPercent}% - v2.7.0";
 
     // Long enough that no branch can render it whole, and built from a character that is trivial
     // to spot in a failure message.
@@ -76,7 +81,6 @@ public sealed class TrayStatusTextTests
         // int.MaxValue durations are reachable: IdleMinutes is only clamped to >= 1, so a
         // hand-edited config multiplies into the hundreds of millions of seconds.
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named(reasonCodeName),
             armed,
@@ -89,7 +93,10 @@ public sealed class TrayStatusTextTests
         Assert.True(
             text.Length <= TrayStatusText.MaxLength,
             $"'{text}' is {text.Length} characters for reason {reasonCodeName} (armed={armed}).");
-        Assert.StartsWith(Prefix, text, StringComparison.Ordinal);
+
+        // The suffix survives even when the body is truncated: it is appended whole, because it is
+        // the section nobody would notice quietly disappearing.
+        Assert.EndsWith(SuffixFor(100), text, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -97,7 +104,6 @@ public sealed class TrayStatusTextTests
     public void ForEvaluation_WithNonsenseNumbers_StaysWithinMaxLength(string reasonCodeName, bool armed)
     {
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named(reasonCodeName),
             armed,
@@ -113,12 +119,12 @@ public sealed class TrayStatusTextTests
 
     [Theory]
     [MemberData(nameof(EveryReasonCodeAndArmedState))]
-    public void ForEvaluation_WithAnOversizedAppName_StaysWithinMaxLength(string reasonCodeName, bool armed)
+    public void ForEvaluation_WithAnOversizedVersion_StaysWithinMaxLength(string reasonCodeName, bool armed)
     {
-        // The prefix is data too. Without its own budget a long app name would eat the whole line
-        // and leave the status -- the entire point of the tooltip -- with nowhere to go.
+        // The version is data too. It comes from an assembly attribute, which a SourceLink-style
+        // build can stuff with a commit hash, so without its own budget the suffix would eat the
+        // whole line and leave the status -- the entire point of the tooltip -- nowhere to go.
         var text = TrayStatusText.ForEvaluation(
-            new string('N', OversizedNameLength),
             degradationReason: null,
             LaunchReasonCode.Named(reasonCodeName),
             armed,
@@ -126,7 +132,8 @@ public sealed class TrayStatusTextTests
             idleSeconds: int.MaxValue,
             requiredIdleSeconds: int.MaxValue,
             cpuPercent: 100d,
-            cpuThresholdPercent: 100);
+            cpuThresholdPercent: 100,
+            versionDisplay: new string('9', OversizedNameLength));
 
         Assert.True(text.Length <= TrayStatusText.MaxLength, $"'{text}' is {text.Length} characters.");
     }
@@ -139,7 +146,6 @@ public sealed class TrayStatusTextTests
         // user cannot otherwise see is worth more tooltip than a fault that is already obvious
         // from the app not doing anything.
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             "lock detection off",
             LaunchReasonCode.Named(reasonCodeName),
             armed: true,
@@ -149,14 +155,13 @@ public sealed class TrayStatusTextTests
             cpuPercent: 37d,
             cpuThresholdPercent: 10);
 
-        Assert.Equal(Prefix + "DEGRADED - lock detection off", text);
+        Assert.Equal("DEGRADED - lock detection off" + Suffix, text);
     }
 
     [Fact]
     public void ForEvaluation_WithA500CharacterDegradationReason_TruncatesToExactlyMaxLength()
     {
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             new string('x', 500),
             LaunchReasonCode.Named("Ready"),
             armed: true,
@@ -170,23 +175,28 @@ public sealed class TrayStatusTextTests
         // on a reason this long, and a short answer would mean a branch is over-reserving.
         Assert.Equal(TrayStatusText.MaxLength, text.Length);
 
-        // And the words that say what happened survive the truncation -- truncating the prefix
+        // And the words that say what happened survive the truncation -- truncating the label
         // away would leave the user with 63 characters of a message they cannot classify.
-        Assert.StartsWith(Prefix + "DEGRADED - ", text, StringComparison.Ordinal);
-        Assert.EndsWith("…", text, StringComparison.Ordinal);
+        Assert.StartsWith("DEGRADED - ", text, StringComparison.Ordinal);
+
+        // The truncation lands on the BODY, immediately before the suffix: the CPU threshold and
+        // the version are appended whole and are never what gets spent. An implementation that
+        // clamped the combined string instead would eat the version off the end, which is the one
+        // section nobody would notice going missing.
+        Assert.EndsWith("…" + Suffix, text, StringComparison.Ordinal);
     }
 
     [Theory]
-    [InlineData("Unknown", true, 200, 300, 37d, 10, "IdleLauncherTray: Status unknown")]
-    [InlineData("NoTargetConfigured", true, 200, 300, 37d, 10, "IdleLauncherTray: No target selected")]
-    [InlineData("SelectedTargetUnsupported", true, 200, 300, 37d, 10, "IdleLauncherTray: Target type not supported")]
-    [InlineData("SelectedTargetMissing", true, 200, 300, 37d, 10, "IdleLauncherTray: Target missing: app.exe")]
-    [InlineData("WorkstationLocked", true, 200, 300, 37d, 10, "IdleLauncherTray: Locked - will not launch")]
-    [InlineData("LaunchCooldownActive", true, 200, 300, 37d, 10, "IdleLauncherTray: Cooldown active")]
-    [InlineData("WaitingForInputIdle", true, 200, 300, 37d, 10, "IdleLauncherTray: Idle 3:20/5:00")]
-    [InlineData("CpuSampleUnavailable", true, 200, 300, 37d, 10, "IdleLauncherTray: CPU reading unavailable")]
-    [InlineData("CpuAboveThreshold", true, 200, 300, 37d, 10, "IdleLauncherTray: CPU 37% > 10%")]
-    [InlineData("Ready", true, 200, 300, 37d, 10, "IdleLauncherTray: Ready to launch")]
+    [InlineData("Unknown", true, 200, 300, 37d, 10, "Status unknown" + Suffix)]
+    [InlineData("NoTargetConfigured", true, 200, 300, 37d, 10, "No target selected" + Suffix)]
+    [InlineData("SelectedTargetUnsupported", true, 200, 300, 37d, 10, "Target type not supported" + Suffix)]
+    [InlineData("SelectedTargetMissing", true, 200, 300, 37d, 10, "Target missing: app.exe" + Suffix)]
+    [InlineData("WorkstationLocked", true, 200, 300, 37d, 10, "Locked - will not launch" + Suffix)]
+    [InlineData("LaunchCooldownActive", true, 200, 300, 37d, 10, "Cooldown active" + Suffix)]
+    [InlineData("WaitingForInputIdle", true, 200, 300, 37d, 10, "Idle 3:20/5:00" + Suffix)]
+    [InlineData("CpuSampleUnavailable", true, 200, 300, 37d, 10, "CPU reading unavailable" + Suffix)]
+    [InlineData("CpuAboveThreshold", true, 200, 300, 37d, 10, "CPU busy 37%" + Suffix)]
+    [InlineData("Ready", true, 200, 300, 37d, 10, "Ready to launch" + Suffix)]
     public void ForEvaluation_RendersTheDocumentedLineForEachReasonCode(
         string reasonCodeName,
         bool armed,
@@ -197,7 +207,6 @@ public sealed class TrayStatusTextTests
         string expected)
     {
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named(reasonCodeName),
             armed,
@@ -221,7 +230,6 @@ public sealed class TrayStatusTextTests
         foreach (var name in LaunchReasonCode.Names)
         {
             var body = BodyOf(TrayStatusText.ForEvaluation(
-                AppName,
                 degradationReason: null,
                 LaunchReasonCode.Named(name),
                 armed: true,
@@ -247,7 +255,6 @@ public sealed class TrayStatusTextTests
         foreach (var name in LaunchReasonCode.Names)
         {
             var body = BodyOf(TrayStatusText.ForEvaluation(
-                AppName,
                 degradationReason: null,
                 LaunchReasonCode.Named(name),
                 armed: true,
@@ -274,7 +281,6 @@ public sealed class TrayStatusTextTests
         // The bug this fixes: a disarmed launcher whose conditions all pass reported "Ready",
         // which is a promise the app was guaranteed not to keep.
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named("Ready"),
             armed: false,
@@ -284,7 +290,7 @@ public sealed class TrayStatusTextTests
             cpuPercent: 1d,
             cpuThresholdPercent: 10);
 
-        Assert.Equal(Prefix + "Disarmed until you use the PC", text);
+        Assert.Equal("Disarmed until you use the PC" + Suffix, text);
     }
 
     [Theory]
@@ -297,7 +303,6 @@ public sealed class TrayStatusTextTests
         // touches the mouse. Masking a broken target behind it sends the user off to wait for a
         // state change that fixes nothing.
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named(reasonCodeName),
             armed: false,
@@ -307,14 +312,13 @@ public sealed class TrayStatusTextTests
             cpuPercent: 1d,
             cpuThresholdPercent: 10);
 
-        Assert.Equal(Prefix + expectedBody, text);
+        Assert.Equal(expectedBody + Suffix, text);
     }
 
     [Fact]
     public void ForEvaluation_WithAMissingTargetAndNoFileName_FallsBackToAGenericBody()
     {
         var text = TrayStatusText.ForEvaluation(
-            AppName,
             degradationReason: null,
             LaunchReasonCode.Named("SelectedTargetMissing"),
             armed: true,
@@ -324,14 +328,15 @@ public sealed class TrayStatusTextTests
             cpuPercent: 0d,
             cpuThresholdPercent: 10);
 
-        Assert.Equal(Prefix + "Target file is missing", text);
+        Assert.Equal("Target file is missing" + Suffix, text);
     }
 
     [Fact]
-    public void ForEvaluation_WithAnEmptyAppName_FallsBackToTheProductName()
+    public void ForEvaluation_WithAnEmptyVersion_StillShowsAVersionSection()
     {
+        // A tooltip that silently drops the version on the one build where the lookup failed is a
+        // tooltip you cannot trust to say what is running, which is the only reason it carries one.
         var text = TrayStatusText.ForEvaluation(
-            "   ",
             degradationReason: null,
             LaunchReasonCode.Named("Ready"),
             armed: true,
@@ -339,42 +344,43 @@ public sealed class TrayStatusTextTests
             idleSeconds: 300,
             requiredIdleSeconds: 300,
             cpuPercent: 1d,
-            cpuThresholdPercent: 10);
+            cpuThresholdPercent: 10,
+            versionDisplay: "   ");
 
-        Assert.Equal(Prefix + "Ready to launch", text);
+        Assert.Equal("Ready to launch - CPU 10% - v?", text);
     }
 
     [Fact]
     public void ForRunningTarget_NamesTheRunningTarget()
     {
         Assert.Equal(
-            Prefix + "Running app.exe",
-            TrayStatusText.ForRunningTarget(AppName, degradationReason: null, "app.exe"));
+            "Running app.exe" + Suffix,
+            TrayStatusText.ForRunningTarget(degradationReason: null, "app.exe"));
     }
 
     [Fact]
     public void ForRunningTarget_WithNoFileName_FallsBackToAGenericBody()
     {
         Assert.Equal(
-            Prefix + "Target is running",
-            TrayStatusText.ForRunningTarget(AppName, degradationReason: null, targetFileName: null));
+            "Target is running" + Suffix,
+            TrayStatusText.ForRunningTarget(degradationReason: null, targetFileName: null));
     }
 
     [Fact]
     public void ForRunningTarget_WithADegradationReason_ReportsTheDegradation()
     {
         Assert.Equal(
-            Prefix + "DEGRADED - CPU sampling stuck",
-            TrayStatusText.ForRunningTarget(AppName, "CPU sampling stuck", "app.exe"));
+            "DEGRADED - CPU sampling stuck" + Suffix,
+            TrayStatusText.ForRunningTarget("CPU sampling stuck", "app.exe"));
     }
 
     [Fact]
     public void ForRunningTarget_WithAnOversizedFileName_StaysWithinMaxLength()
     {
-        var text = TrayStatusText.ForRunningTarget(AppName, null, new string('W', OversizedNameLength));
+        var text = TrayStatusText.ForRunningTarget(null, new string('W', OversizedNameLength));
 
         Assert.True(text.Length <= TrayStatusText.MaxLength, $"'{text}' is {text.Length} characters.");
-        Assert.StartsWith(Prefix + "Running ", text, StringComparison.Ordinal);
+        Assert.StartsWith("Running ", text, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -382,9 +388,9 @@ public sealed class TrayStatusTextTests
     {
         // The monitor tick is the only thing that launches anything. When it throws, the app
         // simply stops working and says nothing -- this is the line that says it.
-        var text = TrayStatusText.ForTickFailure(AppName);
+        var text = TrayStatusText.ForTickFailure();
 
-        Assert.Equal(Prefix + "DEGRADED - monitor tick failed", text);
+        Assert.Equal("DEGRADED - monitor tick failed" + Suffix, text);
         Assert.True(text.Length <= TrayStatusText.MaxLength);
     }
 
@@ -483,7 +489,7 @@ public sealed class TrayStatusTextTests
 
     private static string BodyOf(string text)
     {
-        Assert.StartsWith(Prefix, text, StringComparison.Ordinal);
-        return text[Prefix.Length..];
+        Assert.EndsWith(Suffix, text, StringComparison.Ordinal);
+        return text[..^Suffix.Length];
     }
 }

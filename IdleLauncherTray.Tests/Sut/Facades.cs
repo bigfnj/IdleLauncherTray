@@ -452,7 +452,6 @@ internal static class TrayStatusText
     internal static int MaxLength => Product.ReadConst<int>(TypeName, nameof(MaxLength));
 
     internal static string ForEvaluation(
-        string appName,
         string? degradationReason,
         object reasonCode,
         bool armed,
@@ -460,11 +459,11 @@ internal static class TrayStatusText
         int idleSeconds,
         int requiredIdleSeconds,
         double cpuPercent,
-        int cpuThresholdPercent) =>
+        int cpuThresholdPercent,
+        string? versionDisplay = "2.7.0") =>
         (string)Product.CallStatic(
             TypeName,
             nameof(ForEvaluation),
-            appName,
             degradationReason,
             reasonCode,
             armed,
@@ -472,13 +471,19 @@ internal static class TrayStatusText
             idleSeconds,
             requiredIdleSeconds,
             cpuPercent,
-            cpuThresholdPercent)!;
+            cpuThresholdPercent,
+            versionDisplay)!;
 
-    internal static string ForRunningTarget(string appName, string? degradationReason, string? targetFileName) =>
-        (string)Product.CallStatic(TypeName, nameof(ForRunningTarget), appName, degradationReason, targetFileName)!;
+    internal static string ForRunningTarget(
+        string? degradationReason,
+        string? targetFileName,
+        int cpuThresholdPercent = 10,
+        string? versionDisplay = "2.7.0") =>
+        (string)Product.CallStatic(
+            TypeName, nameof(ForRunningTarget), degradationReason, targetFileName, cpuThresholdPercent, versionDisplay)!;
 
-    internal static string ForTickFailure(string appName) =>
-        (string)Product.CallStatic(TypeName, nameof(ForTickFailure), appName)!;
+    internal static string ForTickFailure(int cpuThresholdPercent = 10, string? versionDisplay = "2.7.0") =>
+        (string)Product.CallStatic(TypeName, nameof(ForTickFailure), cpuThresholdPercent, versionDisplay)!;
 
     internal static string Clamp(string value, int maxLength) =>
         (string)Product.CallStatic(TypeName, nameof(Clamp), value, maxLength)!;

@@ -35,18 +35,21 @@ internal static class TrayStatusText
     /// </summary>
     internal const int MaxLength = 63;
 
-    private const string Separator = ": ";
-    private const string FallbackPrefix = AppPaths.AppName;
+    private const string SectionSeparator = " - ";
 
-    // The prefix is data (the app name and version), so it gets a budget of its own; without one,
-    // a long name could eat the entire line and leave no room for the status that is the point
-    // of it.
+    // The two settled facts that close every tooltip: the CPU threshold currently configured, and
+    // the build that is running. Both are SUFFIXES rather than a prefix, so the part that changes
+    // -- the status -- is what the eye lands on first.
     //
-    // 28 rather than 24 because the prefix now carries the version: "IdleLauncherTray v2.7.0" is
-    // 23, and a two-digit minor or patch ("v2.10.11") reaches 25. At 24 the version would have
-    // started silently truncating at the next release but one, which is exactly the kind of thing
-    // nobody notices until the tooltip reads "v2.10.1" for a 2.10.11 build.
-    private const int MaxPrefixLength = 28;
+    // The app name is deliberately absent. In a tray tooltip it is the one word the user already
+    // knows (they are hovering the icon), and dropping it returns seven characters to the status.
+    // The cost, stated: the tooltip no longer identifies WHICH icon is being hovered, so the icon
+    // itself is the only identification.
+    //
+    // The CPU threshold is CONFIGURATION, sitting beside the idle threshold that "Idle 3:20/15:00"
+    // already shows. It is not the live reading, which belongs in the status when it is the reason
+    // the launcher is waiting.
+    private const int MaxVersionLength = 12;
 
     private const string DegradedPrefix = "DEGRADED - ";
     private const string RunningPrefix = "Running ";
@@ -56,7 +59,6 @@ internal static class TrayStatusText
 
     /// <summary>Status for a tick that evaluated launch readiness.</summary>
     internal static string ForEvaluation(
-        string appName,
         string? degradationReason,
         LaunchReasonCode reasonCode,
         bool armed,
@@ -64,15 +66,16 @@ internal static class TrayStatusText
         int idleSeconds,
         int requiredIdleSeconds,
         double cpuPercent,
-        int cpuThresholdPercent)
+        int cpuThresholdPercent,
+        string? versionDisplay)
     {
-        var prefix = NormalizePrefix(appName);
-        var budget = BodyBudget(prefix);
+        var suffix = BuildSuffix(cpuThresholdPercent, versionDisplay);
+        var budget = BodyBudget(suffix);
 
         // Precedence, first match wins. Every ordering decision below is load-bearing.
         if (!string.IsNullOrWhiteSpace(degradationReason))
         {
-            return Compose(prefix, DegradedBody(degradationReason, budget));
+            return Compose(DegradedBody(degradationReason, budget), suffix);
         }
 
         // Setup faults sit ABOVE the disarmed check. Disarmed clears itself the moment the user
@@ -81,13 +84,13 @@ internal static class TrayStatusText
         switch (reasonCode)
         {
             case LaunchReasonCode.NoTargetConfigured:
-                return Compose(prefix, "No target selected");
+                return Compose("No target selected", suffix);
 
             case LaunchReasonCode.SelectedTargetUnsupported:
-                return Compose(prefix, "Target type not supported");
+                return Compose("Target type not supported", suffix);
 
             case LaunchReasonCode.SelectedTargetMissing:
-                return Compose(prefix, MissingTargetBody(targetFileName, budget));
+                return Compose(MissingTargetBody(targetFileName, budget), suffix);
 
             default:
                 break;
@@ -98,7 +101,7 @@ internal static class TrayStatusText
         // `Ready`, and the tooltip would promise a launch that is guaranteed not to happen.
         if (!armed)
         {
-            return Compose(prefix, "Disarmed until you use the PC");
+            return Compose("Disarmed until you use the PC", suffix);
         }
 
         var body = reasonCode switch
@@ -108,34 +111,41 @@ internal static class TrayStatusText
             LaunchReasonCode.WaitingForInputIdle =>
                 "Idle " + FormatDuration(idleSeconds) + "/" + FormatDuration(requiredIdleSeconds),
             LaunchReasonCode.CpuSampleUnavailable => "CPU reading unavailable",
-            LaunchReasonCode.CpuAboveThreshold =>
-                "CPU " + Percent(cpuPercent) + "% > " + Percent(cpuThresholdPercent) + "%",
+
+            // "CPU busy 37%", not "CPU 37% > 10%". The threshold is in the suffix on every single
+            // tooltip now, so spelling it again here would print the same number twice inside one
+            // 63-character line and spend the budget saying nothing new.
+            LaunchReasonCode.CpuAboveThreshold => "CPU busy " + Percent(cpuPercent) + "%",
             LaunchReasonCode.Ready => "Ready to launch",
             _ => "Status unknown"
         };
 
-        return Compose(prefix, body);
+        return Compose(body, suffix);
     }
 
     /// <summary>Status for a tick that found the previously launched target still running.</summary>
-    internal static string ForRunningTarget(string appName, string? degradationReason, string? targetFileName)
+    internal static string ForRunningTarget(
+        string? degradationReason,
+        string? targetFileName,
+        int cpuThresholdPercent,
+        string? versionDisplay)
     {
-        var prefix = NormalizePrefix(appName);
-        var budget = BodyBudget(prefix);
+        var suffix = BuildSuffix(cpuThresholdPercent, versionDisplay);
+        var budget = BodyBudget(suffix);
 
         // Degradation outranks "running" for the same reason it outranks everything else: the
         // target running is the expected case, and a fault the user cannot otherwise see is not.
         return string.IsNullOrWhiteSpace(degradationReason)
-            ? Compose(prefix, RunningBody(targetFileName, budget))
-            : Compose(prefix, DegradedBody(degradationReason, budget));
+            ? Compose(RunningBody(targetFileName, budget), suffix)
+            : Compose(DegradedBody(degradationReason, budget), suffix);
     }
 
     /// <summary>Status for a tick that threw. The monitor loop is the only thing keeping the
     /// launcher honest, so a failing tick has to be visible without opening the log.</summary>
-    internal static string ForTickFailure(string appName)
+    internal static string ForTickFailure(int cpuThresholdPercent, string? versionDisplay)
     {
-        var prefix = NormalizePrefix(appName);
-        return Compose(prefix, DegradedBody(TickFailureReason, BodyBudget(prefix)));
+        var suffix = BuildSuffix(cpuThresholdPercent, versionDisplay);
+        return Compose(DegradedBody(TickFailureReason, BodyBudget(suffix)), suffix);
     }
 
     /// <summary>
@@ -245,26 +255,44 @@ internal static class TrayStatusText
             : MissingTargetPrefix + Clamp(name, budget - MissingTargetPrefix.Length);
     }
 
-    private static int BodyBudget(string prefix) => MaxLength - prefix.Length - Separator.Length;
+    private static int BodyBudget(string suffix) => MaxLength - suffix.Length;
 
-    private static string NormalizePrefix(string appName)
+    /// <summary>
+    /// The trailing " - CPU 10% - v2.7.0". Bounded by construction: the threshold is normalised to
+    /// two digits and the version is clamped, so the suffix can never grow enough to crowd out the
+    /// status it follows.
+    /// </summary>
+    private static string BuildSuffix(int cpuThresholdPercent, string? versionDisplay)
     {
-        if (string.IsNullOrWhiteSpace(appName))
+        var version = Normalize(versionDisplay);
+        if (version.Length == 0)
         {
-            return FallbackPrefix;
+            // "?" rather than omitting the section. A tooltip that silently drops the version on
+            // the one build where the lookup failed is a tooltip you cannot trust to tell you what
+            // is running, which is the only reason it is there.
+            version = "?";
         }
 
-        return Clamp(appName.Trim(), MaxPrefixLength);
+        return SectionSeparator + "CPU " + Percent(cpuThresholdPercent) + "%"
+            + SectionSeparator + "v" + Clamp(version, MaxVersionLength);
     }
 
-    private static string Compose(string prefix, string body)
+    private static string Compose(string body, string suffix)
     {
-        // Two independent guarantees, on purpose. The per-branch budget above is what keeps the
-        // INTERESTING text — it spends the truncation on the file name rather than on the words
-        // that explain what is wrong. This Clamp is the unconditional backstop: it makes "never
-        // longer than MaxLength" true even for a branch that a future edit budgets incorrectly,
-        // and it is the one that a broken budget would trip rather than the shell.
-        return Clamp(prefix + Separator + body, MaxLength);
+        // The BODY is clamped and the suffix is appended whole, rather than clamping the combined
+        // string. Clamping the pair would spend the truncation on the tail, which is where the
+        // version lives -- and the version is the one section that never changes, so its quiet
+        // disappearance is the one nobody would ever notice.
+        var budget = MaxLength - suffix.Length;
+        if (budget <= 0)
+        {
+            // Unreachable while the suffix is bounded, but this keeps the function total: a suffix
+            // that somehow filled the line is still returned inside the limit rather than handed
+            // to NotifyIcon.Text, which throws above it.
+            return Clamp(suffix, MaxLength);
+        }
+
+        return Clamp(body, budget) + suffix;
     }
 
     private static string Normalize(string? value) => (value ?? string.Empty).Trim();

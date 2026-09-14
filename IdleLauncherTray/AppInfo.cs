@@ -31,19 +31,9 @@ internal static class AppInfo
     /// </remarks>
     internal static string VersionDisplay { get; } = ResolveVersionDisplay();
 
-    /// <summary>
-    /// What the tray icon calls itself: "IdleLauncherTray v2.7.0".
-    /// </summary>
-    /// <remarks>
-    /// A tray-only app has nowhere else to say which build is running. The version is in the exe's
-    /// file properties and in the first line of every log, but neither is reachable from the tray,
-    /// which is the only surface this app has.
-    /// <para>
-    /// Built once here rather than at each of the three tooltip call sites, so the two cannot
-    /// drift and the 63-character budget is spent against one known prefix.
-    /// </para>
-    /// </remarks>
-    internal static string TrayDisplayName { get; } = $"{AppPaths.AppName} v{VersionDisplay}";
+    // NOTE: there is deliberately no combined "name v1.2.3" member here. The tooltip carries the
+    // version as a bare "v2.7.0" suffix and no app name at all, so a prebuilt display string would
+    // have had exactly zero callers.
 
     private static string ResolveVersionDisplay()
     {

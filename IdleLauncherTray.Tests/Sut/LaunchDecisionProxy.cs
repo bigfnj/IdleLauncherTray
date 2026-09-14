@@ -92,9 +92,6 @@ internal static class AppInfo
 
     internal static string VersionDisplay =>
         Product.ReadStaticProperty<string>(TypeName, nameof(VersionDisplay));
-
-    internal static string TrayDisplayName =>
-        Product.ReadStaticProperty<string>(TypeName, nameof(TrayDisplayName));
 }
 
 /// <summary>

@@ -112,7 +112,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
     // Last text successfully applied to NotifyIcon.Text, seeded with the value the NotifyIcon is
     // constructed with so the first genuine status change is the first syscall.
-    private string _lastTrayStatusText = AppInfo.TrayDisplayName;
+    private string _lastTrayStatusText = string.Empty;
     private bool _trayStatusFailureLogged;
 
     // Degradation notification state. The reason STRING is remembered rather than a bool: see
@@ -178,7 +178,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         _notify = new NotifyIcon
         {
-            Text = AppInfo.TrayDisplayName,
+            Text = AppPaths.AppName,
             Visible = true
         };
 
@@ -1199,9 +1199,10 @@ internal sealed class TrayAppContext : ApplicationContext
                 var runningDegradation = ComposeDegradationReason();
                 UpdateDegradationNotification(runningDegradation);
                 SetTrayStatusText(TrayStatusText.ForRunningTarget(
-                    AppInfo.TrayDisplayName,
                     runningDegradation,
-                    TargetFileNameOrNull(TargetFilePolicy.NormalizePath(_cfg.AppPath))));
+                    TargetFileNameOrNull(TargetFilePolicy.NormalizePath(_cfg.AppPath)),
+                    _cfg.CpuThresholdPercent,
+                    AppInfo.VersionDisplay));
 
                 return;
             }
@@ -1269,7 +1270,6 @@ internal sealed class TrayAppContext : ApplicationContext
             var degradation = ComposeDegradationReason();
             UpdateDegradationNotification(degradation);
             SetTrayStatusText(TrayStatusText.ForEvaluation(
-                AppInfo.TrayDisplayName,
                 degradation,
                 evaluation.ReasonCode,
                 _armed,
@@ -1277,7 +1277,8 @@ internal sealed class TrayAppContext : ApplicationContext
                 evaluation.IdleSeconds,
                 evaluation.RequiredIdleSeconds,
                 evaluation.CpuPercent,
-                evaluation.CpuThresholdPercent));
+                evaluation.CpuThresholdPercent,
+                AppInfo.VersionDisplay));
         }
         catch (Exception ex)
         {
@@ -1300,7 +1301,7 @@ internal sealed class TrayAppContext : ApplicationContext
             // unhandled UI-thread exception and takes the process down via Program.cs.
             try
             {
-                SetTrayStatusText(TrayStatusText.ForTickFailure(AppInfo.TrayDisplayName));
+                SetTrayStatusText(TrayStatusText.ForTickFailure(_cfg.CpuThresholdPercent, AppInfo.VersionDisplay));
             }
             catch
             {
