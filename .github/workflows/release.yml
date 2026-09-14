@@ -13,11 +13,14 @@ jobs:
       contents: write   # required to create GitHub Releases on a public repo
 
     steps:
+      # Actions are pinned to commit SHAs, not tags. This job holds `contents: write`, so a
+      # mutable tag would let whoever controls the action repository run new code against a
+      # token that can write to this repository. The trailing comment records the release.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup .NET 10 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: '10.0.x'
 
@@ -74,7 +77,7 @@ jobs:
           "$hash  $zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: IdleLauncherTray ${{ github.ref_name }}
@@ -89,8 +92,15 @@ jobs:
       # runas-helper. The git TAGS are retained (no --cleanup-tag), so any pruned release can be
       # rebuilt from its tag -- deleting the tag would make this irreversible.
       # Best-effort: a prune failure never fails a release that already published.
+      #
+      # There is deliberately NO `if:` here. This step previously carried
+      # `if: steps.version.outputs.is_tag == 'true'`, but the `version` step only ever writes
+      # `version` and `assembly` to $GITHUB_OUTPUT -- `is_tag` was never set, so the condition
+      # was always '' == 'true' and the step NEVER RAN, silently, for its whole existence.
+      # The guard was redundant anyway: this workflow's only trigger is `push: tags: v[0-9]*`,
+      # so reaching this step already proves a version tag was pushed. A condition that can
+      # never be true is worse than no condition, because it looks like a working control.
       - name: Prune old releases (keep the 3 most recent; tags retained)
-        if: steps.version.outputs.is_tag == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
@@ -101,9 +111,15 @@ jobs:
             $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName,createdAt |
                         ConvertFrom-Json
           } catch { Write-Host "prune: could not list releases: $_"; exit 0 }
+          Write-Host "prune: $($releases.Count) release(s) found; keeping the $keep most recent."
           $old = @($releases | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -Skip $keep)
+          if ($old.Count -eq 0) {
+            # Say so out loud. A prune that quietly deletes nothing is indistinguishable from
+            # a prune that never ran -- which is exactly the bug this step just came back from.
+            Write-Host "prune: nothing to delete (at most $keep releases exist)."
+          }
           foreach ($r in $old) {
             Write-Host "Deleting old release $($r.tagName) (git tag kept)"
             gh release delete $r.tagName --repo $env:GITHUB_REPOSITORY --yes
           }
-          Write-Host "Kept the $keep most recent releases."
+          Write-Host "prune: deleted $($old.Count) release(s); kept the $keep most recent."

@@ -1,6 +1,7 @@
-# CLAUDE.md
+# Architecture
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+How IdleLauncherTray is put together: the subsystems, the launch-readiness state machine, and the
+design decisions worth knowing before changing anything.
 
 ## Project Overview
 
@@ -107,7 +108,9 @@ This produces a single `IdleLauncherTray.exe` targeting `win-x64` (requires .NET
 
 - **Idle threshold**: Configurable in minutes (default from config)
 - **CPU threshold**: Configurable 10-50% (default from config)
-- **Target executable**: Selectable via tray menu (supports `.exe`, `.scr`, `.bat` with optional arguments)
+- **Target executable**: Selectable via tray menu, with optional arguments. `TargetFilePolicy.cs`
+  is the single source of truth for the supported list; see "Supported target types" above rather
+  than repeating it here, because a second copy of that list has drifted before
 - **Startup mode**: Enabled/disabled via tray menu (writes to Windows registry)
 - **Block injected input**: Optional checkbox in tray menu
 - **Lock on close**: Optional checkbox in tray menu
@@ -145,13 +148,22 @@ Uninstall uses `DeletionHelper` with command-line invocation to work around lock
 
 ## Testing
 
-No automated test suite is included. Validation is manual:
-- Launch the app and verify tray icon appears
-- Configure idle/CPU thresholds and target
-- Verify launch occurs when conditions are met
-- Verify "Run Now" works independently
-- Test startup registry toggling
-- Verify log output in `%APPDATA%\IdleLauncherTray\IdleLauncherTray.log`
+`IdleLauncherTray.Tests` (xunit) runs with `dotnet test IdleLauncherTray.sln -c Release`. CI fails
+the run if fewer than 150 tests execute, because `dotnet test` exits 0 when zero tests match a
+filter, so a broken or unreferenced test project would otherwise turn CI green by testing nothing.
+
+Every product type is `internal` and there is no `InternalsVisibleTo`: the tests reach product code
+by reflection through the facades in `IdleLauncherTray.Tests/Sut/`. The shipping DLL is therefore
+identical to what would ship without a test project.
+
+**A green `dotnet test` does not mean the app works.** The suite covers pure logic only:
+`TargetFilePolicy`, `ConfigManager`, `CpuUsageMonitor`'s FILETIME arithmetic, `DeletionHelper`'s
+self-delete guard, the tray status formatter and the launch-readiness record. Not covered, and
+needing a real desktop session: the tray icon and menu, hook installation, launching, cooldown,
+lock-on-close, the startup registry entry and the uninstall flow.
+
+`SMOKE_TEST.md` is the manual checklist that exercises the app as an app, and `tools/smoke-test.sh`
+runs the automated half (build, test, publish, single-file and icon-resource checks).
 
 ## Logging
 

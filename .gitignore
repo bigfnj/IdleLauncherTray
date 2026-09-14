@@ -40,7 +40,11 @@ packages/
 
 # Build Artifacts
 publish/
-PublishProfiles/
+# Anchored to the repo root on purpose. Unanchored, `PublishProfiles/` also matches the
+# TRACKED IdleLauncherTray/Properties/PublishProfiles/*.pubxml that the release workflow
+# depends on. That is inert while the file is in the index, but a `git rm --cached` would
+# make it silently un-re-addable without -f.
+/PublishProfiles/
 # Release workflow staging directory (release.yml builds the zip from here).
 stage/
 # `dotnet test` writes .trx and coverage here. Added with the first test project in v2.5.0 --
