@@ -25,7 +25,17 @@ using System.Threading;
 
 namespace IdleLauncherTray;
 
-public static class PhysicalIdle
+// `internal`, like every other type in this assembly. It was the one exception, and the
+// exception cost something concrete: the product .csproj is <OutputType>WinExe</OutputType>
+// and every consumer is TrayAppContext in this same assembly, so nothing outside could ever
+// have bound to it -- but the TEST assembly could, and did. A test in the
+// IdleLauncherTray.Tests namespace resolves the bare name `PhysicalIdle` by walking out to
+// the enclosing IdleLauncherTray namespace, found this type because it was public, and bound
+// straight to the product, silently skipping the reflection facade the rest of the suite goes
+// through on purpose. Narrowing the type is what makes that binding impossible rather than
+// merely discouraged; the facade still reaches everything here through
+// BindingFlags.NonPublic, which type accessibility does not affect.
+internal static class PhysicalIdle
 {
     private const int WH_KEYBOARD_LL = 13;
     private const int WH_MOUSE_LL = 14;
@@ -232,8 +242,13 @@ public static class PhysicalIdle
     //
     // Written with a single Interlocked.Exchange from both hook callbacks (they run on the
     // UI thread and block all system input until they return, so nothing heavier belongs
-    // there) and read from the tick. 64-bit, so the interlocked write is also what makes
-    // the read safe on a 32-bit runtime.
+    // there -- no lock, in particular) and read from the tick. 64-bit, so the interlocked
+    // write is also what makes the read safe on a 32-bit runtime.
+    //
+    // The callbacks stay outside _hookLivenessLock and that is sound, because a callback can
+    // only move this FORWARD. The tick's other writers -- NotifyExternalActivity and
+    // EnsureHooksStarted -- advance it under that lock, because for them the advance and the
+    // counter resets beside it are one act the tick must not be able to interleave with.
     private static long _lastHookCallbackMilliseconds = GetMonotonicMilliseconds();
 
     // How far behind the system's own idle clock the heartbeat has to fall before a tick
@@ -251,9 +266,16 @@ public static class PhysicalIdle
     private const int HookSilenceTicksRequired = 3;
 
     // Advanced only from the tick (TryRepairHooksIfNeeded), which is the only periodic entry
-    // point into this class. Every other writer only ever RESETS it to zero, so the worst a
-    // lost update can do is delay detection by one tick -- it can never fabricate one. The
-    // interlocked access is for visibility to readers on other threads, not for exclusion.
+    // point into this class. Every other writer only ever RESETS it to zero.
+    //
+    // That used to read "so the worst a lost update can do is delay detection by one tick --
+    // it can never fabricate one", and that was wrong in the one direction that matters. The
+    // tick is a read-modify-write, so the update that gets lost is the RESET, not the
+    // advance: a reset landing between the tick's read and its write-back is overwritten by
+    // a verdict computed before the reset existed, which puts evidence back rather than
+    // taking it away. That is a fabricated alarm, on precisely the lock/unlock cycle the
+    // reset was added to excuse. Both fields are now written under _hookLivenessLock; the
+    // interlocked access that remains is for visibility to the lock-free readers.
     private static int _consecutiveHookSilenceTicks;
 
     // 0/1 latch published by the tick and read by GetIdleMilliseconds (called from the tray
@@ -264,7 +286,9 @@ public static class PhysicalIdle
 
     // Set by the tray while the workstation is locked or the session is disconnected. Written
     // on the SystemEvents notification thread, read on the tick; single writer, single reader,
-    // no compound invariant, so volatile is sufficient.
+    // no compound invariant of its own, so volatile is sufficient and the write deliberately
+    // stays outside _hookLivenessLock. The COUNTER RESETS that accompany it do not: see
+    // SetHookSilenceExpected.
     private static volatile bool _hookSilenceExpected;
 
     // The reason string last handed to the log, so an episode is announced once instead of
@@ -300,6 +324,44 @@ public static class PhysicalIdle
 
     private static readonly object _gamepadLock = new();
     private static readonly object _hookInstallLock = new();
+
+    // Serialises the hook-liveness tick against everything that RESETS it.
+    //
+    // UpdateHookLivenessState is a read-modify-write: it reads _hookSilenceExpected, then
+    // both clocks, then _consecutiveHookSilenceTicks, decides, and writes the counter and
+    // the latch back. NotifyExternalActivity and SetHookSilenceExpected run on the
+    // SystemEvents thread and zero those same two fields. Interlocked makes each individual
+    // write atomic; it says nothing about the sequence. A reset that lands between the
+    // tick's read and its write-back is simply overwritten -- the tick puts back evidence
+    // the unlock had just declared void, and three ticks later the tray reports "input hooks
+    // stopped firing" for an ordinary lock/unlock cycle, which is the precise false alarm
+    // the reset exists to prevent.
+    //
+    // So the tick's whole read-compute-write is one critical section, and each resetter's
+    // zeroing group is the same critical section. THE CLOCK READS BELONG INSIDE IT: hoisting
+    // the heartbeat read out reopens the race in its original shape (stale read, reset,
+    // stale write-back).
+    //
+    // What deliberately stays OUTSIDE it:
+    //   - The hook callbacks. They run on the UI thread and block ALL system input until
+    //     they return, so they take this lock -- or any lock -- never. Their bare
+    //     Interlocked.Exchange on the heartbeat is safe out here because a callback can only
+    //     move the heartbeat FORWARD, and a heartbeat that moved forward can only shorten
+    //     the gap the tick measures. It can make the verdict more conservative; it cannot
+    //     manufacture a false alarm.
+    //   - LogDegradationTransition, which does a synchronous file append under Logger's own
+    //     global lock. Holding this across it would park the SystemEvents thread behind a
+    //     disk write on every lock and every unlock.
+    //   - The readers. GetHookDegradationReason and GetIdleMilliseconds stay lock-free on
+    //     Volatile.Read. The race here is writer against writer, and GetIdleMilliseconds is
+    //     called from the launch path on other threads, where blocking would be a worse
+    //     outcome than reading a latch one tick out of date.
+    //
+    // Lock order is _hookInstallLock -> _hookLivenessLock, because EnsureHooksStarted resets
+    // these counters while holding the install lock. Never the reverse: nothing called under
+    // this lock may reach back for _hookInstallLock.
+    private static readonly object _hookLivenessLock = new();
+
     private const int HookRepairRetryIntervalMs = 30000;
 
     private static int _gamepadPollInProgress;
@@ -378,6 +440,17 @@ public static class PhysicalIdle
         public uint dwTime;
     }
 
+    // GetLastInputInfo refuses the call unless cbSize describes the struct, so every call
+    // has to fill it in. The size of a sequential struct of two uints is settled when this
+    // assembly is compiled: it cannot vary by machine, by process or by call. Marshal.SizeOf
+    // is still a runtime lookup (type handle -> marshalling layout) and it was being asked
+    // the same question on every tick and on every launch evaluation -- roughly 17,000 times
+    // a day for an answer that was never going to change. `const` is not available here:
+    // Marshal.SizeOf is not a constant expression, and sizeof() over a managed struct needs
+    // an unsafe context this project deliberately does not enable, so static readonly is the
+    // cheapest form the language allows.
+    private static readonly uint _lastInputInfoSizeBytes = (uint)Marshal.SizeOf<LASTINPUTINFO>();
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
@@ -421,7 +494,7 @@ public static class PhysicalIdle
         {
             var lii = new LASTINPUTINFO
             {
-                cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>()
+                cbSize = _lastInputInfoSizeBytes
             };
 
             if (!GetLastInputInfo(ref lii))
@@ -720,6 +793,41 @@ public static class PhysicalIdle
         return consecutiveSuspectTicks >= required;
     }
 
+    /// <summary>
+    /// The counter half of one tick, as a pure function of its parameters -- the companion
+    /// to <see cref="IsHookDropSuspected"/>, which owns the verdict. Split out for the same
+    /// reason: it is a whole decision, and the interesting cases (a counter already at the
+    /// cap, a counter that has somehow reached <see cref="int.MaxValue"/>, a machine that
+    /// has been idle for eight hours) are reachable as arguments instead of as elapsed time.
+    /// </summary>
+    /// <param name="currentTicks">The counter as it stands before this tick.</param>
+    /// <param name="maxTicks">
+    /// Where the counter saturates. The caller passes
+    /// <see cref="HookSilenceTicksRequired"/>: ticks beyond the threshold carry no
+    /// information, and a counter that only ever grows is a counter that eventually
+    /// overflows into a negative and silently disarms the detector.
+    /// </param>
+    /// <returns>Zero when this tick produced no evidence, otherwise the advanced counter.</returns>
+    internal static int NextHookSilenceTicks(
+        double systemIdleMs,
+        long lastCallbackMs,
+        long nowMs,
+        int currentTicks,
+        int maxTicks)
+    {
+        if (!HasHookSilenceEvidence(systemIdleMs, lastCallbackMs, nowMs))
+        {
+            return 0;
+        }
+
+        // Written as a comparison rather than Math.Min(currentTicks + 1, maxTicks) because
+        // the ADDITION is the thing that overflows: at int.MaxValue the increment wraps to
+        // int.MinValue first and Math.Min then dutifully keeps the negative, leaving the
+        // detector permanently below any threshold. Comparing before adding saturates DOWN
+        // to maxTicks instead, which is the only direction that can be correct here.
+        return currentTicks >= maxTicks ? maxTicks : currentTicks + 1;
+    }
+
     // One tick's worth of evidence that a hook stopped firing.
     //
     // GetLastInputInfo is the cross-check, and the asymmetry is what makes it one: when our
@@ -765,50 +873,68 @@ public static class PhysicalIdle
     }
 
     // Advances the detector by one tick. Called only from TryRepairHooksIfNeeded, never
-    // from a callback: it needs GetLastInputInfo and it may write to the log, and neither
-    // belongs on a path that blocks all system input until it returns.
+    // from a callback: it needs GetLastInputInfo, it takes a lock, and it may write to the
+    // log. None of those belongs on a path that blocks all system input until it returns --
+    // and the lock is the sharpest of the three, because a callback that waited on it would
+    // freeze the desktop and then be dropped by Windows for overrunning LowLevelHooksTimeout,
+    // which is the exact fault this detector exists to report.
     private static void UpdateHookLivenessState()
     {
-        // While the workstation is locked, hook silence is EXPECTED, not evidence. Input on the
-        // secure desktop never reaches a default-desktop hook, but it does keep refreshing
-        // GetLastInputInfo -- so the moment someone touches the lock screen, the gap between the
-        // two clocks jumps to the full lock duration and, by design, does not shrink again. Three
-        // ticks later the detector would latch and the tray would report "input hooks stopped
-        // firing" for a machine whose hooks are perfectly healthy.
-        //
-        // Clearing on unlock (which NotifyExternalActivity does) only cleans up AFTER the false
-        // alarm has already been logged and ballooned. A warning that fires on every lock cycle is
-        // a warning the user learns to ignore, which would cost this feature the only thing it is
-        // for. So refuse to gather evidence in the first place, and reset what is there.
-        if (_hookSilenceExpected)
+        // Everything that reads or writes the two counters happens inside _hookLivenessLock,
+        // in one critical section, INCLUDING the two clock reads. Interlocked alone only
+        // made each write atomic: a reset from the SystemEvents thread that landed between
+        // the reads below and the write-backs was overwritten by a verdict computed before
+        // it, restoring evidence the reset had just voided. See the field's declaration for
+        // why the callbacks, the logger and the readers are all deliberately outside it.
+        lock (_hookLivenessLock)
         {
-            Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
-            Interlocked.Exchange(ref _hookDropSuspected, 0);
-            LogDegradationTransition();
-            return;
+            // While the workstation is locked, hook silence is EXPECTED, not evidence. Input on
+            // the secure desktop never reaches a default-desktop hook, but it does keep refreshing
+            // GetLastInputInfo -- so the moment someone touches the lock screen, the gap between
+            // the two clocks jumps to the full lock duration and, by design, does not shrink
+            // again. Three ticks later the detector would latch and the tray would report "input
+            // hooks stopped firing" for a machine whose hooks are perfectly healthy.
+            //
+            // Clearing on unlock (which NotifyExternalActivity does) only cleans up AFTER the
+            // false alarm has already been logged and ballooned. A warning that fires on every
+            // lock cycle is a warning the user learns to ignore, which would cost this feature the
+            // only thing it is for. So refuse to gather evidence in the first place, and reset
+            // what is there.
+            if (_hookSilenceExpected)
+            {
+                Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+                Interlocked.Exchange(ref _hookDropSuspected, 0);
+            }
+            else
+            {
+                // One clock sample for both readings: taking nowMs twice would let the two ages be
+                // measured against different instants and invent a gap out of nothing.
+                var nowMs = GetMonotonicMilliseconds();
+                var systemIdleMs = GetSystemIdleMilliseconds();
+                var lastCallbackMs = Interlocked.Read(ref _lastHookCallbackMilliseconds);
+
+                var ticks = NextHookSilenceTicks(
+                    systemIdleMs,
+                    lastCallbackMs,
+                    nowMs,
+                    Volatile.Read(ref _consecutiveHookSilenceTicks),
+                    HookSilenceTicksRequired);
+
+                Interlocked.Exchange(ref _consecutiveHookSilenceTicks, ticks);
+
+                // Asked through the pure rule rather than inferred from `ticks` alone, so the
+                // whole decision lives in the one function the tests exercise and there is no
+                // second copy of it here to drift.
+                var suspected = IsHookDropSuspected(systemIdleMs, lastCallbackMs, nowMs, ticks, HookSilenceTicksRequired);
+                Interlocked.Exchange(ref _hookDropSuspected, suspected ? 1 : 0);
+            }
         }
 
-        // One clock sample for both readings: taking nowMs twice would let the two ages be
-        // measured against different instants and invent a gap out of nothing.
-        var nowMs = GetMonotonicMilliseconds();
-        var systemIdleMs = GetSystemIdleMilliseconds();
-        var lastCallbackMs = Interlocked.Read(ref _lastHookCallbackMilliseconds);
-
-        // Capped at the threshold rather than free-running: ticks beyond it carry no
-        // information, and a counter that only ever grows is a counter that can overflow
-        // into a negative value and silently disarm the detector.
-        var ticks = HasHookSilenceEvidence(systemIdleMs, lastCallbackMs, nowMs)
-            ? Math.Min(Volatile.Read(ref _consecutiveHookSilenceTicks) + 1, HookSilenceTicksRequired)
-            : 0;
-
-        Interlocked.Exchange(ref _consecutiveHookSilenceTicks, ticks);
-
-        // Asked through the pure rule rather than inferred from `ticks` alone, so the whole
-        // decision lives in the one function the tests exercise and there is no second copy
-        // of it here to drift.
-        var suspected = IsHookDropSuspected(systemIdleMs, lastCallbackMs, nowMs, ticks, HookSilenceTicksRequired);
-        Interlocked.Exchange(ref _hookDropSuspected, suspected ? 1 : 0);
-
+        // OUTSIDE the lock, on both paths. This reads the latch back and can do a synchronous
+        // file append under Logger's global lock; a resetter on the SystemEvents thread must
+        // never have to wait behind that. Reading the latch a moment after publishing it is
+        // safe: the only thing that can have changed it in between is a resetter clearing it,
+        // and an episode that was just cancelled is not one worth announcing.
         LogDegradationTransition();
     }
 
@@ -891,14 +1017,28 @@ public static class PhysicalIdle
         //
         // Set it BEFORE the caller's own locked flag on the way in and AFTER clearing it on the
         // way out, so no tick can ever observe "unlocked" while silence is still being excused.
+        //
+        // This write stays OUTSIDE _hookLivenessLock on purpose. It is one half of an ordering
+        // contract with the tray's own locked flag, and the contract is about which of the two
+        // flags is published first -- putting it inside would delay the publish behind whatever
+        // the tick is doing, which is the opposite of what the contract asks for. It is a
+        // volatile write to a single bool with no compound invariant of its own; the tick reads
+        // it under the lock and acts on whichever value it sees, and both answers are correct.
         _hookSilenceExpected = expected;
 
         if (expected)
         {
             // Drop evidence gathered in the ticks just before the lock event was delivered:
             // SystemEvents is asynchronous, so the lock has usually already happened.
-            Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
-            Interlocked.Exchange(ref _hookDropSuspected, 0);
+            //
+            // The two resets ARE a group, and the group is what the lock protects: a tick that
+            // read the counter before this point must not be allowed to write its verdict back
+            // afterwards. Interlocked on its own left exactly that window open.
+            lock (_hookLivenessLock)
+            {
+                Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+                Interlocked.Exchange(ref _hookDropSuspected, 0);
+            }
         }
     }
 
@@ -921,19 +1061,32 @@ public static class PhysicalIdle
         // idle time they never accrued.
         AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, nowMs);
 
-        // The heartbeat has to move too, not just the counters. Input on the secure desktop
-        // is invisible to a hook on the default desktop, so a lock/unlock cycle leaves the
-        // heartbeat as old as the lock was long while GetLastInputInfo reports the unlock
-        // keystroke as recent -- a gap that is real, benign, and would otherwise read as a
-        // dropped hook on the very next tick. Resetting the counters without the heartbeat
-        // would only postpone that by HookSilenceTicksRequired ticks.
-        AdvanceMonotonicTimestamp(ref _lastHookCallbackMilliseconds, nowMs);
+        // The heartbeat advance and the two counter resets are ONE act, so they happen under
+        // one lock. Split apart they are three writes a tick can interleave with: the tick
+        // reads the old heartbeat, this method advances it and zeroes the counters, and then
+        // the tick writes back a verdict reached from the stale reading -- putting the whole
+        // lock/unlock gap back as fresh evidence, which is what this call exists to erase.
+        //
+        // AdvanceMonotonicTimestamp(_lastPhysicalInputMilliseconds) above and the Logger call
+        // below are deliberately outside: the idle clock is not part of this invariant (it is
+        // shared with the hook callbacks, which take no lock), and logging under the lock
+        // would park the tick behind a synchronous file append.
+        lock (_hookLivenessLock)
+        {
+            // The heartbeat has to move too, not just the counters. Input on the secure desktop
+            // is invisible to a hook on the default desktop, so a lock/unlock cycle leaves the
+            // heartbeat as old as the lock was long while GetLastInputInfo reports the unlock
+            // keystroke as recent -- a gap that is real, benign, and would otherwise read as a
+            // dropped hook on the very next tick. Resetting the counters without the heartbeat
+            // would only postpone that by HookSilenceTicksRequired ticks.
+            AdvanceMonotonicTimestamp(ref _lastHookCallbackMilliseconds, nowMs);
 
-        // External activity is an absence of evidence, not evidence of health: it says we
-        // could not have seen this input, so nothing the counters accumulated across it
-        // means anything. Start the next episode from zero.
-        Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
-        Interlocked.Exchange(ref _hookDropSuspected, 0);
+            // External activity is an absence of evidence, not evidence of health: it says we
+            // could not have seen this input, so nothing the counters accumulated across it
+            // means anything. Start the next episode from zero.
+            Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+            Interlocked.Exchange(ref _hookDropSuspected, 0);
+        }
 
         Logger.Info(
             $"External activity reported ({describedReason}). The idle clock was advanced and the hook-liveness detector was reset, because input this process cannot observe is not evidence about the hooks either way.");
@@ -1008,9 +1161,19 @@ public static class PhysicalIdle
                 // says nothing about it -- and the outage that just ended is exactly the
                 // kind of silence that would otherwise still be sitting in the heartbeat,
                 // reported as a fresh drop on the next tick.
-                Interlocked.Exchange(ref _lastHookCallbackMilliseconds, nowMs);
-                Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
-                Interlocked.Exchange(ref _hookDropSuspected, 0);
+                //
+                // This is a resetter like the other two, so it takes _hookLivenessLock for
+                // the same reason: a tick that read the heartbeat a moment ago must not be
+                // able to write its verdict over this. LOCK ORDER IS
+                // _hookInstallLock -> _hookLivenessLock, which is what this nesting is, and
+                // it is never inverted -- nothing reached from under the liveness lock asks
+                // for the install lock.
+                lock (_hookLivenessLock)
+                {
+                    Interlocked.Exchange(ref _lastHookCallbackMilliseconds, nowMs);
+                    Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
+                    Interlocked.Exchange(ref _hookDropSuspected, 0);
+                }
             }
         }
     }

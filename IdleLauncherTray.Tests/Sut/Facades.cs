@@ -207,6 +207,32 @@ internal static class PhysicalIdle
             consecutiveSuspectTicks,
             requiredTicks)!;
 
+    /// <summary>
+    /// The counter half of the tick. Pure, like <see cref="IsHookDropSuspected"/>, so the cap
+    /// and the overflow case are reachable as arguments rather than as elapsed time.
+    /// </summary>
+    internal static int NextHookSilenceTicks(
+        double systemIdleMs,
+        long lastCallbackMs,
+        long nowMs,
+        int currentTicks,
+        int maxTicks) =>
+        (int)Product.CallStatic(
+            TypeName,
+            nameof(NextHookSilenceTicks),
+            systemIdleMs,
+            lastCallbackMs,
+            nowMs,
+            currentTicks,
+            maxTicks)!;
+
+    /// <summary>
+    /// The product's <c>_hookLivenessLock</c>, so a test can take it and then observe who
+    /// waits for it and who does not. That distinction is the whole point of the lock: the
+    /// tick and the two resetters must wait, and the hook callbacks must not.
+    /// </summary>
+    internal static object HookLivenessLock => ReadField<object>("_hookLivenessLock");
+
     internal static string? GetHookDegradationReason() =>
         (string?)Product.CallStatic(TypeName, nameof(GetHookDegradationReason));
 
