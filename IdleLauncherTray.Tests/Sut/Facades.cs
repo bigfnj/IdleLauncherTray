@@ -37,11 +37,52 @@ internal static class TargetFilePolicy
     internal static bool IsSupportedTarget(string? path) =>
         (bool)Product.CallStatic(TypeName, nameof(IsSupportedTarget), path)!;
 
+    /// <summary>Boxed as the product enum type, so a test compares against <see cref="TargetPathStatus"/>.</summary>
+    internal static object ClassifyTarget(string? path) =>
+        Product.CallStatic(TypeName, nameof(ClassifyTarget), path)!;
+
+    internal static string PrepareForStorage(string? path) =>
+        (string)Product.CallStatic(TypeName, nameof(PrepareForStorage), path)!;
+
+    internal static string ResolveForUse(string? path) =>
+        (string)Product.CallStatic(TypeName, nameof(ResolveForUse), path)!;
+
     internal static string NormalizePath(string? path) =>
         (string)Product.CallStatic(TypeName, nameof(NormalizePath), path)!;
 
+    internal static string ForDisplay(string? path) =>
+        (string)Product.CallStatic(TypeName, nameof(ForDisplay), path)!;
+
     internal static string GetUnsupportedTargetMessage(string? path) =>
         (string)Product.CallStatic(TypeName, nameof(GetUnsupportedTargetMessage), path)!;
+}
+
+/// <summary>
+/// Mirror of the product's <c>IdleLauncherTray.TargetPathStatus</c> enum, which the test assembly
+/// cannot name because the product type is internal.
+/// <para>
+/// <see cref="Names"/> comes from <see cref="Enum.GetNames(Type)"/> rather than a literal list for
+/// the same reason <c>LaunchReasonCode</c> does: a hand-maintained mirror stops covering a member
+/// added tomorrow and stays green while doing it.
+/// </para>
+/// </summary>
+internal static class TargetPathStatus
+{
+    private const string TypeName = "TargetPathStatus";
+
+    internal static Type EnumType { get; } = Product.TypeNamed(TypeName);
+
+    internal static IReadOnlyList<string> Names { get; } = Enum.GetNames(EnumType);
+
+    internal static object Named(string name) => Enum.Parse(EnumType, name);
+
+    internal static object Empty => Named(nameof(Empty));
+
+    internal static object Unparseable => Named(nameof(Unparseable));
+
+    internal static object UnsupportedType => Named(nameof(UnsupportedType));
+
+    internal static object Supported => Named(nameof(Supported));
 }
 
 /// <summary>

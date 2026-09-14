@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using IdleLauncherTray.Tests.Sut;
 
 namespace IdleLauncherTray.Tests;
@@ -252,12 +253,184 @@ public sealed class ConfigManagerTests
     }
 
     [Fact]
-    public void Load_KeepsAndNormalisesASupportedAppPath()
+    public void Load_KeepsASupportedAppPathAsTheUserWroteIt()
     {
         using var data = new TempDataDirectory();
         data.WriteConfigFile("{ \"AppPath\": \"  \\\"C:/tools/sub/../app.exe\\\"  \" }");
 
-        Assert.Equal("C:\\tools\\app.exe", ConfigManager.Load().AppPath);
+        var loaded = ConfigManager.Load();
+
+        // Trimmed and unquoted -- both lossless -- and nothing else. Collapsing the dot segment
+        // would be harmless on its own, but it is the same step that expands %APPDATA%, and
+        // normalisation runs on Save too, so whatever this method returns is what lands on disk.
+        Assert.Equal("C:/tools/sub/../app.exe", loaded.AppPath);
+
+        // ...and it still resolves to the real file at the point of use.
+        Assert.Equal("C:\\tools\\app.exe", TargetFilePolicy.ResolveForUse(loaded.AppPath));
+    }
+
+    [Fact]
+    public void SaveThenLoad_LeavesAnEnvironmentVariablePathUnexpandedInTheFile()
+    {
+        using var data = new TempDataDirectory();
+
+        ConfigManager.Save(new ConfigProxy { AppPath = "%APPDATA%\\tools\\app.exe" });
+
+        // Assert on the FILE, not on the object. The object could hold the right string while Save
+        // wrote the expanded one, and the file is the half that travels to the next machine.
+        var onDisk = File.ReadAllText(data.ConfigFile);
+        Assert.Contains("\"AppPath\": \"%APPDATA%\\\\tools\\\\app.exe\"", onDisk, StringComparison.Ordinal);
+
+        // JSON doubles every backslash, so the expanded form has to be doubled before looking for
+        // it -- searching for the raw spelling would find nothing here even when the bug is back.
+        var expanded = Environment.ExpandEnvironmentVariables("%APPDATA%\\tools\\app.exe");
+        Assert.NotEqual("%APPDATA%\\tools\\app.exe", expanded); // the check is only real if %APPDATA% resolves
+        Assert.DoesNotContain(
+            expanded.Replace("\\", "\\\\", StringComparison.Ordinal),
+            onDisk,
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Equal("%APPDATA%\\tools\\app.exe", ConfigManager.Load().AppPath);
+    }
+
+    [Fact]
+    public void Load_WithAnEnvironmentVariablePath_StillResolvesToAUsableAbsolutePath()
+    {
+        using var data = new TempDataDirectory();
+        using var tools = new EnvironmentVariableScope("ILT_TEST_TOOLS", "C:\\tools\\bin");
+        data.WriteConfigFile("{ \"AppPath\": \"%ILT_TEST_TOOLS%\\\\app.exe\" }");
+
+        var loaded = ConfigManager.Load();
+
+        Assert.Equal("%ILT_TEST_TOOLS%\\app.exe", loaded.AppPath);
+        Assert.Equal("C:\\tools\\bin\\app.exe", TargetFilePolicy.ResolveForUse(loaded.AppPath));
+    }
+
+    [Fact]
+    public void Load_ChecksTheTargetTypeThroughAnEnvironmentVariable_AndKeepsTheVariable()
+    {
+        // The support check has to keep working on the RAW string now that the raw string is what
+        // is stored, which it does because ClassifyTarget expands internally. Otherwise keeping the
+        // user's spelling would have quietly disabled the only validation the app performs.
+        //
+        // The variable supplies the file NAME, so the unexpanded path has no extension at all and
+        // would be cleared as an unsupported type. Asserting the .exe is KEPT is therefore an
+        // assertion that expansion really happened -- an unsupported variable would be cleared
+        // either way and would prove nothing, which a mutation run demonstrated.
+        using var data = new TempDataDirectory();
+        using var target = new EnvironmentVariableScope("ILT_TEST_TARGET", "app.exe");
+        data.WriteConfigFile("{ \"IdleMinutes\": 9, \"AppPath\": \"C:\\\\tools\\\\%ILT_TEST_TARGET%\" }");
+
+        var loaded = ConfigManager.Load();
+
+        // IdleMinutes pins that the file was really read: a swallowed parse failure hands back
+        // defaults, and those have nothing to say about expansion either way.
+        Assert.Equal(9, loaded.IdleMinutes);
+        Assert.Equal("C:\\tools\\%ILT_TEST_TARGET%", loaded.AppPath);
+        Assert.Equal("C:\\tools\\app.exe", TargetFilePolicy.ResolveForUse(loaded.AppPath));
+    }
+
+    [Fact]
+    public void Load_WithAnUnsupportedExtension_ClearsItAndRecordsThatTheTypeWasTheFault()
+    {
+        using var data = new TempDataDirectory();
+        data.WriteConfigFile("{ \"AppPath\": \"C:\\\\tools\\\\notes.txt\" }");
+
+        var log = new LogCapture();
+        var loaded = ConfigManager.Load();
+
+        Assert.Equal(string.Empty, loaded.AppPath);
+
+        // The wording is the deliverable, not decoration: clearing a setting silently is how this
+        // app loses user data, so the log has to name what went and why.
+        Assert.Contains("unsupported target TYPE", log.Text, StringComparison.Ordinal);
+        Assert.Contains("cleared", log.Text, StringComparison.Ordinal);
+        Assert.Contains("C:\\tools\\notes.txt", log.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Load_WithAMalformedAppPath_KeepsItAndRecordsThatThePathWasTheFault()
+    {
+        using var data = new TempDataDirectory();
+        var malformed = "C:\\" + new string('a', 33_000) + ".exe";
+        data.WriteConfigFile($"{{ \"AppPath\": \"C:\\\\{new string('a', 33_000)}.exe\" }}");
+
+        var log = new LogCapture();
+        var loaded = ConfigManager.Load();
+
+        // Kept, not cleared. The stored value is no longer environment-expanded, so whether it
+        // parses is a fact about THIS machine: clearing would destroy a setting made on another
+        // one, and because normalisation runs on Save the loss would reach disk immediately.
+        Assert.Equal(malformed, loaded.AppPath);
+
+        // Nothing will launch it here, which is what makes keeping it safe rather than a trap.
+        Assert.False(TargetFilePolicy.IsSupportedTarget(loaded.AppPath));
+
+        // And the log says which fault it was, in the opposite direction to the test above.
+        Assert.Contains("cannot interpret", log.Text, StringComparison.Ordinal);
+        Assert.Contains("KEPT", log.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("unsupported target TYPE", log.Text, StringComparison.Ordinal);
+
+        // The log rotates at 2 MB. A 33,000-character path per Load would be a real cost, and the
+        // truncation is the only thing keeping one malformed setting from filling it.
+        Assert.True(log.Text.Length < 2_000, $"one Load wrote {log.Text.Length} characters of log");
+    }
+
+    [Fact]
+    public void Save_WritesTheSameBytesTheNonDurableImplementationDid()
+    {
+        using var data = new TempDataDirectory();
+
+        ConfigManager.Save(new ConfigProxy
+        {
+            IdleMinutes = 17,
+            CpuThresholdPercent = 30,
+            AppPath = "%APPDATA%\\tools\\app.exe",
+            AppArguments = "/s --quiet",
+            RunAtStartup = true,
+            BlockInjectedWhileRunning = true,
+            LockPcOnAppClose = true,
+            AllowLaunchWhileLocked = true,
+            GamepadCountsAsActivity = false,
+            UseSystemIdleFailSafe = false,
+            SystemIdleFailSafeWindowMs = 9000,
+            TrayIconEnabled = true,
+            TrayIconPath = "C:\\icons\\tray.ico",
+            LastLaunchUtc = "2026-09-11T12:34:56.0000000Z",
+        });
+
+        // Joined on an explicit "\r\n" rather than written as a multi-line literal: this source
+        // file is LF (.editorconfig) while Utf8JsonWriter indents with Environment.NewLine, so a
+        // verbatim literal would pin the wrong bytes and match the file only by accident.
+        var expected = string.Join(
+            "\r\n",
+            "{",
+            "  \"IdleMinutes\": 17,",
+            "  \"CpuThresholdPercent\": 30,",
+            "  \"AppPath\": \"%APPDATA%\\\\tools\\\\app.exe\",",
+            "  \"AppArguments\": \"/s --quiet\",",
+            "  \"RunAtStartup\": true,",
+            "  \"BlockInjectedWhileRunning\": true,",
+            "  \"LockPcOnAppClose\": true,",
+            "  \"AllowLaunchWhileLocked\": true,",
+            "  \"GamepadCountsAsActivity\": false,",
+            "  \"UseSystemIdleFailSafe\": false,",
+            "  \"SystemIdleFailSafeWindowMs\": 9000,",
+            "  \"TrayIconEnabled\": true,",
+            "  \"TrayIconPath\": \"C:\\\\icons\\\\tray.ico\",",
+            "  \"LastLaunchUtc\": \"2026-09-11T12:34:56.0000000Z\"",
+            "}");
+
+        var actual = File.ReadAllBytes(data.ConfigFile);
+
+        // Bytes, not text. Swapping File.WriteAllText for a FileStream was supposed to change WHEN
+        // the file reaches the disk and nothing about what is in it -- and the one difference a
+        // string comparison would miss is a BOM, which this app would read back happily while
+        // every other reader of config.json saw a changed file.
+        Assert.Equal(Encoding.UTF8.GetBytes(expected), actual);
+        Assert.False(
+            actual.Length >= 3 && actual[0] == 0xEF && actual[1] == 0xBB && actual[2] == 0xBF,
+            "config.json was written with a UTF-8 BOM");
     }
 
     [Fact]

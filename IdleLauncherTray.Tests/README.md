@@ -12,8 +12,10 @@ dotnet test IdleLauncherTray.sln -c Release
 | Area | What is asserted |
 | --- | --- |
 | `TargetFilePolicy` | every accepted extension and a batch of rejected ones, case-insensitivity, quote/whitespace stripping, environment-variable expansion, relative paths anchored on the executable folder, UNC paths, dot-segment collapsing, the code/message-string consistency, and that a path `Path.GetFullPath` rejects produces an answer instead of an exception |
+| `TargetFilePolicy`'s storage/use split | that `PrepareForStorage` keeps a `%VAR%` spelling, a relative path and a dot segment exactly as written, that `ResolveForUse` expands and roots the same string, that `NormalizePath` is still the same function as `ResolveForUse`, and that `ClassifyTarget` calls a malformed path unparseable rather than an unsupported type — with the user-facing message following it, so an `.exe` is never refused over a list containing `.exe` |
 | `DeletionHelper` | `IsSafeDeleteTarget` and `NormalizeFolderPath` — it accepts only the app's own data directory (in any letter case, with or without a trailing separator) and refuses a parent, a child, a sibling, a name that merely shares its prefix, a drive root, a UNC share root, a relative path and empty input |
 | `ConfigManager` | defaults, full save/load round trip, every normalisation clamp, comment/trailing-comma tolerance, and that a corrupt, empty, wrong-shaped or unreadable file yields defaults rather than an exception |
+| `ConfigManager`'s target handling | that a `%APPDATA%` path survives `Save` then `Load` with the variable still present **in the file on disk**, that the support check still runs through an expanded variable, that an unsupported type is still cleared and an unparseable path is deliberately kept, that each writes a log line naming which of the two it was, and that `Save` emits the exact UTF-8 bytes — no BOM — the pre-durability `File.WriteAllText` produced |
 | `CpuUsageMonitor` | the FILETIME halves combining without sign extension, the first-sample priming, the divide-by-zero guard when two samples land in one clock tick, the counter-regression re-baseline for each of the three counters independently, and the idle-exceeds-total clamp |
 | `AppPaths` | the `IDLELAUNCHERTRAY_DATA_DIR` override, the fall-back to `%APPDATA%`, and the canary described below |
 | `PhysicalIdle` hook liveness | the rule that decides a hook was silently dropped — that an idle user is never reported as one at any tick count, that an unusable `GetLastInputInfo` reading is not evidence, the grace and tick thresholds, that both callbacks move the heartbeat even when told to pass the event straight through, the reason strings fitting the tray tooltip, and that an external-activity report advances the idle clock without ever moving it backwards |
@@ -42,7 +44,14 @@ This suite protects the pure functions. It does not protect the app.
   calls it from all three places, and that `NotifyIcon.Text` accepts the result, needs a
   tray icon.
 - **`StartupManager`** — writes to `HKCU\...\Run`. Testable in principle, untested here
-  because it mutates real machine state.
+  because it mutates real machine state. That now includes the rule that a Run value
+  existing under our value name means **enabled**, whatever path it holds — there is no
+  seam to fake the registry behind, so `SMOKE_TEST.md` is the only thing that can check
+  it. Write a Run value through an 8.3 short name or a junction, reopen the tray, and the
+  "Run at startup" tick must be on.
+- **`ConfigManager.Save`'s durability** — the tests pin the bytes and that no `.tmp`
+  survives, but nothing here proves `Flush(flushToDisk: true)` reached the platter.
+  Verifying that needs a power cut, not an assertion.
 - **`Logger`** — only its path is asserted, not rotation or its locking.
 - **`DeletionHelper`'s actual deletion** — the retry loop, the read-only attribute
   clearing, the deferred child process and its wait-for-parent-exit. Only the guard that
@@ -142,6 +151,20 @@ guard from the evidence rule is killed for a negative or `NegativeInfinity` read
 for `PositiveInfinity`, because `callbackAge - PositiveInfinity` is already negative and no
 gap can exceed the grace. The guard stays, for the two cases that do need it and because the
 intent should not depend on that arithmetic.
+
+The config/path round added six more, each applied to the real source and rebuilt — the harness
+prints the product DLL's timestamp before and after, so a green run cannot come from a stale
+build. Persisting the expanded path again was killed by 4 tests; calling an unparseable path an
+unsupported type by 3; writing `config.json` with a UTF-8 BOM by 1; clearing an unparseable stored
+path instead of keeping it by 1; dropping the display truncation by 2.
+
+The sixth is the one worth recording. Removing the expansion from `ClassifyTarget` was killed by
+the existing `IsSupportedTarget_ExpandsEnvironmentVariablesBeforeDeciding` but **not** by the new
+`ConfigManager` test written to cover the same ground: its variable named a `.txt`, so the path was
+cleared whether or not expansion happened and the test proved nothing. It now uses a variable
+naming an `.exe`, where an unexpanded path has no extension and is cleared while an expanded one is
+kept — so the assertion can only pass if expansion really ran. A test whose axis is degenerate
+passes for a reason that has nothing to do with the behaviour it names.
 
 The one test method no mutation kills is
 `AppPathsTests.TestRun_NeverPointsBaseDir_AtTheRealUserDataDirectory`. The only mutation

@@ -10,6 +10,10 @@ namespace IdleLauncherTray.Tests;
 /// </summary>
 public sealed class TargetFilePolicyTests
 {
+    /// <summary>In declaration order, which is the order <see cref="Enum.GetNames(Type)"/> returns.</summary>
+    private static readonly string[] ExpectedTargetPathStatusNames =
+        ["Empty", "Unparseable", "UnsupportedType", "Supported"];
+
     [Theory]
     [InlineData(".exe")]
     [InlineData(".scr")]
@@ -207,6 +211,167 @@ public sealed class TargetFilePolicyTests
 
         Assert.Null(exception);
         Assert.Equal(tooLong, TargetFilePolicy.NormalizePath($"  \"{tooLong}\"  "));
+    }
+
+    [Theory]
+    [InlineData("%APPDATA%\\tools\\app.exe")]
+    [InlineData("  %APPDATA%\\tools\\app.exe  ")]
+    [InlineData("\"%APPDATA%\\tools\\app.exe\"")]
+    [InlineData("  \"%APPDATA%\\tools\\app.exe\"  ")]
+    public void PrepareForStorage_KeepsEnvironmentVariablesUnexpanded(string asTheUserWroteIt)
+    {
+        // Trimming and unquoting are lossless; expansion is not. A user who writes %APPDATA% has
+        // chosen a spelling that follows the config to another machine, which is the whole point
+        // of a portable app -- and a literal path containing %...% has no other way to survive.
+        Assert.Equal("%APPDATA%\\tools\\app.exe", TargetFilePolicy.PrepareForStorage(asTheUserWroteIt));
+    }
+
+    [Theory]
+    [InlineData("payloads\\app.exe")]
+    [InlineData("C:/tools/sub/../app.exe")]
+    public void PrepareForStorage_DoesNotAnchorOrCollapseThePath(string asTheUserWroteIt)
+    {
+        // The same rule as expansion, for the same reason: rooting a relative path or collapsing
+        // a dot segment bakes in an answer that depends on this machine's layout.
+        Assert.Equal(asTheUserWroteIt, TargetFilePolicy.PrepareForStorage($"  \"{asTheUserWroteIt}\"  "));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("     ")]
+    [InlineData("\"\"")]
+    [InlineData("  \"  \"  ")]
+    public void PrepareForStorage_ReturnsEmptyForEmptyInput(string? path)
+    {
+        Assert.Equal(string.Empty, TargetFilePolicy.PrepareForStorage(path));
+    }
+
+    [Fact]
+    public void ResolveForUse_ExpandsWhatPrepareForStorageDeliberatelyKept()
+    {
+        // The pair is the design: store the portable spelling, resolve it at each point of use.
+        // Neither half is worth anything without the other -- storage that cannot be resolved is
+        // a dead setting, and resolution that gets stored is the bug this replaced.
+        using (new EnvironmentVariableScope("ILT_TEST_TOOLS", "C:\\tools\\bin"))
+        {
+            var stored = TargetFilePolicy.PrepareForStorage("  \"%ILT_TEST_TOOLS%\\app.exe\"  ");
+
+            Assert.Equal("%ILT_TEST_TOOLS%\\app.exe", stored);
+            Assert.Equal("C:\\tools\\bin\\app.exe", TargetFilePolicy.ResolveForUse(stored));
+        }
+    }
+
+    [Theory]
+    [InlineData("C:\\tools\\app.exe")]
+    [InlineData("  \"C:/tools/sub/../app.exe\"  ")]
+    [InlineData("payloads\\app.exe")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void NormalizePath_IsStillTheSameFunctionAsResolveForUse(string? path)
+    {
+        // NormalizePath survives only because TrayAppContext calls it at its four points of use.
+        // If the two ever diverge, half the app resolves a target differently from the other half.
+        Assert.Equal(TargetFilePolicy.ResolveForUse(path), TargetFilePolicy.NormalizePath(path));
+    }
+
+    [Theory]
+    [InlineData("C:\\tools\\app.exe", "Supported")]
+    [InlineData("%APPDATA%\\tools\\app.exe", "Supported")]
+    [InlineData("C:\\tools\\notes.txt", "UnsupportedType")]
+    [InlineData("C:\\tools\\launcher", "UnsupportedType")]
+    [InlineData(null, "Empty")]
+    [InlineData("   ", "Empty")]
+    [InlineData("\"\"", "Empty")]
+    public void ClassifyTarget_NamesWhichFaultItIs(string? path, string expectedStatus)
+    {
+        Assert.Equal(TargetPathStatus.Named(expectedStatus), TargetFilePolicy.ClassifyTarget(path));
+    }
+
+    [Fact]
+    public void ClassifyTarget_WithAMalformedPath_ReportsAnUnparseablePath_NotAnUnsupportedType()
+    {
+        // Path.GetFullPath throws on this, so there is no normalised path to read an extension
+        // from. Note the string ends in ".exe" -- a *supported* type -- which is exactly why
+        // answering "unsupported type" was a diagnosis the user could not act on.
+        var malformed = "C:\\" + new string('a', 33_000) + ".exe";
+
+        Assert.Equal(TargetPathStatus.Unparseable, TargetFilePolicy.ClassifyTarget(malformed));
+        Assert.NotEqual(TargetPathStatus.UnsupportedType, TargetFilePolicy.ClassifyTarget(malformed));
+
+        // Still refused, so nothing downstream tries to launch it.
+        Assert.False(TargetFilePolicy.IsSupportedTarget(malformed));
+    }
+
+    [Theory]
+    [InlineData("C:\\tools\\app.exe")]
+    [InlineData("C:\\tools\\notes.txt")]
+    [InlineData("C:\\tools\\launcher")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    public void IsSupportedTarget_CannotDisagreeWithClassifyTarget(string? path)
+    {
+        // IsSupportedTarget is what TrayAppContext still calls. The split into a status must not
+        // change a single answer it gives.
+        Assert.Equal(
+            TargetPathStatus.Supported.Equals(TargetFilePolicy.ClassifyTarget(path)),
+            TargetFilePolicy.IsSupportedTarget(path));
+    }
+
+    [Fact]
+    public void TargetPathStatus_DeclaresExactlyTheFourOutcomesCallersHandle()
+    {
+        // ConfigManager switches on this enum and treats two of the four as faults with opposite
+        // handling. A fifth member added without revisiting that switch would fall into its
+        // default and be silently ignored, which is the failure mode this whole codebase has.
+        Assert.Equal(ExpectedTargetPathStatusNames, TargetPathStatus.Names);
+    }
+
+    [Fact]
+    public void GetUnsupportedTargetMessage_WithAMalformedPath_DoesNotBlameTheTargetType()
+    {
+        var malformed = "C:\\" + new string('a', 33_000) + ".exe";
+
+        var message = TargetFilePolicy.GetUnsupportedTargetMessage(malformed);
+
+        // The old message offered the supported-extension list -- which contains ".exe", the very
+        // extension the user had chosen. Telling someone their .exe is not an .exe is worse than
+        // saying nothing.
+        Assert.DoesNotContain(TargetFilePolicy.SupportedExtensionsDisplay, message, StringComparison.Ordinal);
+        Assert.Contains("cannot interpret", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GetUnsupportedTargetMessage_WithAMalformedPath_ShowsEnoughOfItToRecogniseWithoutDumpingIt()
+    {
+        var malformed = "C:\\" + new string('a', 33_000) + ".exe";
+
+        var message = TargetFilePolicy.GetUnsupportedTargetMessage(malformed);
+
+        // A 33,000-character MessageBox cannot be read, and the same text reaches a log file that
+        // rotates at 2 MB. The count of dropped characters stays, because the length IS the fault
+        // being reported.
+        Assert.True(message.Length < 1_000, $"the message ran to {message.Length} characters");
+        Assert.Contains("aaaa", message, StringComparison.Ordinal);
+        Assert.Contains("more characters", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GetUnsupportedTargetMessage_WithAnUnsupportedType_StillOffersTheSupportedList()
+    {
+        // The other half of the split: the message that was always right must not have changed.
+        var message = TargetFilePolicy.GetUnsupportedTargetMessage("C:\\tools\\notes.txt");
+
+        Assert.Contains(TargetFilePolicy.SupportedExtensionsDisplay, message, StringComparison.Ordinal);
+        Assert.DoesNotContain("cannot interpret", message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("C:\\tools\\app.exe")]
+    public void ForDisplay_LeavesAPathAnyoneCouldReadAlone(string path)
+    {
+        Assert.Equal(path, TargetFilePolicy.ForDisplay(path));
     }
 
     [Fact]
