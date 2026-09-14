@@ -551,6 +551,37 @@ public sealed class HookLivenessTests
             NextTicks(currentTicks: int.MaxValue - 1, maxTicks: int.MaxValue));
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void NextHookSilenceTicks_WithZeroOrNegativeMaxTicks_StillBanksATickInsteadOfDisarmingTheDetector(int maxTicks)
+    {
+        // The floor IsHookDropSuspected has always put on requiredTicks, which this method was
+        // missing. Both are parameters on an internal method the facade calls directly, so
+        // neither value is hypothetical.
+        //
+        // maxTicks: 0 does not bound the counter, it TURNS THE DETECTOR OFF: every tick of
+        // evidence is pinned at zero, no threshold is ever met and nothing is ever reported --
+        // silently, which is the failure shape this whole file exists to rule out. A negative
+        // cap is worse again, because `currentTicks >= maxTicks` is satisfied immediately and
+        // the counter comes back NEGATIVE, permanently below any threshold.
+        var banked = NextTicks(currentTicks: 0, maxTicks);
+
+        Assert.Equal(1, banked);
+        Assert.True(banked >= 0, $"A cap of {maxTicks} produced a counter of {banked}.");
+
+        // Saturating DOWN, not up: a floored cap is still a cap.
+        Assert.Equal(1, NextTicks(currentTicks: 1, maxTicks));
+        Assert.Equal(1, NextTicks(currentTicks: 99, maxTicks));
+
+        // And the point of all of it: a caller passing the same degenerate value to both halves
+        // of the tick still gets a working detector, because one tick of evidence is worth one
+        // tick at both ends.
+        Assert.True(
+            Suspect(EvidenceSystemIdleMs, EvidenceCallbackAgeMs, banked, requiredTicks: maxTicks),
+            $"With maxTicks={maxTicks} the detector never reports anything, whatever the evidence.");
+    }
+
     [Fact]
     public void UpdateHookLivenessState_WhileTheLivenessLockIsHeld_WaitsForIt()
     {
@@ -896,5 +927,237 @@ public sealed class HookLivenessTests
         }
 
         public void Dispose() => _entered.Dispose();
+    }
+}
+
+/// <summary>
+/// Covers who owns <c>_gamepadPollInProgress</c>, the flag that keeps two <c>PollGamepads</c>
+/// callbacks out of the four-slot <c>_gpConnected</c> / <c>_gpLastPacket</c> /
+/// <c>_gpLastState</c> arrays at the same time.
+/// <para>
+/// The rule is one line long and the tests below are all about its edges: the callback that
+/// takes the flag is the callback that clears it, and nothing on the start/stop path may clear
+/// it on that callback's behalf. The path that got this wrong was the one that had just logged
+/// that the callback was still running.
+/// </para>
+/// <para>
+/// No controller is needed. XInput answers ERROR_DEVICE_NOT_CONNECTED for empty slots, which is
+/// a complete poll as far as the guard is concerned, and the two tests that must not reach a
+/// poll at all are arranged so that they cannot.
+/// </para>
+/// </summary>
+public sealed class GamepadPollGuardTests
+{
+    private const string PollInProgressField = "_gamepadPollInProgress";
+    private const string StopRequestedField = "_gamepadStopRequested";
+    private const string TimerField = "_gamepadTimer";
+    private const string ConnectedField = "_gpConnected";
+    private const string NextPollField = "_gpNextPollMilliseconds";
+    private const string BackoffField = "_gpDisconnectedBackoffMs";
+
+    [Fact]
+    public void StopGamepadTimer_WhileACallbackStillHoldsTheGuard_LeavesTheGuardWithThatCallback()
+    {
+        // The case worth changing this for: XInputGetState is blocked in a driver, the bounded
+        // wait inside StopGamepadTimer expires, and the method LOGS that the callback is still
+        // running -- and then used to zero that callback's guard anyway on its way out. The
+        // next callback in walks straight into arrays the hung one is still writing.
+        using var gamepad = new GamepadPollStateScope(gamepadEnabled: false);
+
+        // A stand-in timer rather than a started one. StopGamepadTimer only calls Change and
+        // Dispose on this object, while a real timer would run PollGamepads on a thread pool
+        // thread and move the flag below for reasons this test did not arrange.
+        using var standInTimer = new System.Threading.Timer(_ => { }, null, Timeout.Infinite, Timeout.Infinite);
+        PhysicalIdle.WriteField(TimerField, standInTimer);
+
+        // What a hung callback leaves behind: it took the guard and has not given it back.
+        PhysicalIdle.WriteField(PollInProgressField, 1);
+
+        StopGamepadTimer();
+
+        // Witnesses first. Both are written past the "no timer, nothing to do" early return, so
+        // together they prove the teardown really ran and the assertion below is about the
+        // guard rather than about a call that returned on its first line.
+        Assert.Null(PhysicalIdle.ReadField<object?>(TimerField));
+        Assert.Equal(1, PhysicalIdle.ReadField<int>(StopRequestedField));
+
+        Assert.Equal(
+            1,
+            PhysicalIdle.ReadField<int>(PollInProgressField));
+    }
+
+    [Fact]
+    public void StartGamepadTimer_WhileAnOrphanedCallbackHoldsTheGuard_DoesNotHandItToTheNewTimer()
+    {
+        // The same mistake on the way back in, and the pair is what makes it reachable: a user
+        // who toggles gamepad support off during a driver hang and straight back on. Clearing
+        // the guard here admits a fresh callback beside the orphan, and the orphan's own
+        // finally then clears the fresh one's guard and admits a third.
+        //
+        // Gamepad support is off for the duration so the timer started below cannot take the
+        // guard itself. That matters: with the flag cleared, a real callback would re-take it
+        // microseconds later and let this assertion pass on timing rather than on behaviour.
+        using var gamepad = new GamepadPollStateScope(gamepadEnabled: false);
+
+        PhysicalIdle.WriteField(PollInProgressField, 1);
+
+        StartGamepadTimer();
+
+        // Witness: a timer really was created, so what follows is about the body of the method
+        // and not about the "already running" early return at the top of it.
+        Assert.NotNull(PhysicalIdle.ReadField<object?>(TimerField));
+
+        Assert.Equal(
+            1,
+            PhysicalIdle.ReadField<int>(PollInProgressField));
+    }
+
+    [Fact]
+    public void PollGamepads_WhenAnotherCallbackHoldsTheGuard_ReturnsWithoutClearingIt()
+    {
+        // Re-entry, from the timer's own callback. A bounced callback returns ABOVE the try, so
+        // it never reaches the finally: it cannot clear a guard it does not own, and the
+        // callback that does own it is still the one that will give it back.
+        using var gamepad = new GamepadPollStateScope(gamepadEnabled: true);
+        PhysicalIdle.WriteField(PollInProgressField, 1);
+        ClearSlotSchedule();
+
+        PollGamepads();
+
+        Assert.Equal(1, PhysicalIdle.ReadField<int>(PollInProgressField));
+
+        // And it got nowhere near the slots. The companion test below fills this in from an
+        // identical arrangement, which is what makes the emptiness here mean something.
+        Assert.False(
+            EverySlotWasVisited(),
+            "A callback that bounced off the guard still touched the controller arrays.");
+    }
+
+    [Fact]
+    public void PollGamepads_WhenNothingHoldsTheGuard_TakesItAndGivesItBack()
+    {
+        // The other half of the rule, and the non-degeneracy witness for the test above: with
+        // the guard free the same call really does run a full poll, so "the flag survived" up
+        // there is a fact about the guard and not about some earlier return this suite cannot
+        // see. It also pins the only clear of the flag that is allowed to exist.
+        using var gamepad = new GamepadPollStateScope(gamepadEnabled: true);
+        PhysicalIdle.WriteField(PollInProgressField, 0);
+        ClearSlotSchedule();
+
+        PollGamepads();
+
+        Assert.True(
+            EverySlotWasVisited(),
+            "The poll never reached the slots, so nothing about taking the guard was exercised.");
+        Assert.Equal(0, PhysicalIdle.ReadField<int>(PollInProgressField));
+    }
+
+    private static void StartGamepadTimer() => Product.CallStatic(PhysicalIdle.TypeName, "StartGamepadTimer");
+
+    private static void StopGamepadTimer() => Product.CallStatic(PhysicalIdle.TypeName, "StopGamepadTimer");
+
+    /// <summary>Invokes the timer callback directly, with the <c>null</c> state the timer passes it.</summary>
+    private static void PollGamepads() =>
+        Product.CallStatic(PhysicalIdle.TypeName, "PollGamepads", new object?[] { null });
+
+    private static bool GamepadEnabled
+    {
+        get => (bool)Product.PropertyNamed(PhysicalIdle.TypeName, nameof(GamepadEnabled)).GetValue(null)!;
+        set => Product.PropertyNamed(PhysicalIdle.TypeName, nameof(GamepadEnabled)).SetValue(null, value);
+    }
+
+    /// <summary>
+    /// Puts the four slots in the state a fresh <c>StartGamepadTimer</c> leaves them in: nothing
+    /// connected and nothing scheduled, so the next poll has to visit every slot instead of
+    /// skipping one on a backoff an earlier test left behind.
+    /// </summary>
+    private static void ClearSlotSchedule()
+    {
+        Array.Clear(PhysicalIdle.ReadField<Array>(ConnectedField));
+        Array.Clear(PhysicalIdle.ReadField<Array>(NextPollField));
+        Array.Clear(PhysicalIdle.ReadField<Array>(BackoffField));
+    }
+
+    /// <summary>
+    /// True once a poll has looked at every slot. A connected pad leaves <c>_gpConnected</c>
+    /// set; an empty one leaves a retry scheduled. A slot nothing looked at has neither, which
+    /// is exactly what <see cref="ClearSlotSchedule"/> arranges.
+    /// </summary>
+    private static bool EverySlotWasVisited()
+    {
+        var connected = (bool[])PhysicalIdle.ReadField<Array>(ConnectedField);
+        var nextPollMs = (long[])PhysicalIdle.ReadField<Array>(NextPollField);
+
+        for (var i = 0; i < connected.Length; i++)
+        {
+            if (!connected[i] && nextPollMs[i] == 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Saves every piece of gamepad state these tests move and puts it back, including when the
+    /// body throws — and stops any timer a test started, because a stray poll running on into
+    /// the next test would write the idle clock from nowhere.
+    /// </summary>
+    private sealed class GamepadPollStateScope : IDisposable
+    {
+        // Restored by copying elements back rather than by reassigning the fields: two of the
+        // five are `static readonly`, and FieldInfo.SetValue throws FieldAccessException on an
+        // initonly static. The contents are what the product mutates in any case.
+        private static readonly string[] SlotArrayFields =
+        {
+            ConnectedField,
+            "_gpLastPacket",
+            "_gpLastState",
+            NextPollField,
+            BackoffField,
+        };
+
+        private readonly int _previousPollInProgress;
+        private readonly int _previousStopRequested;
+        private readonly bool _previousGamepadEnabled;
+        private readonly Array[] _previousSlots;
+
+        internal GamepadPollStateScope(bool gamepadEnabled)
+        {
+            // Nothing else in this suite starts gamepad polling, so a live timer here would mean
+            // an earlier test left one running -- and every arrangement below would then be
+            // racing a real callback instead of describing one.
+            Assert.Null(PhysicalIdle.ReadField<object?>(TimerField));
+
+            _previousPollInProgress = PhysicalIdle.ReadField<int>(PollInProgressField);
+            _previousStopRequested = PhysicalIdle.ReadField<int>(StopRequestedField);
+            _previousGamepadEnabled = GamepadEnabled;
+            _previousSlots = Array.ConvertAll(
+                SlotArrayFields,
+                fieldName => (Array)PhysicalIdle.ReadField<Array>(fieldName).Clone());
+
+            GamepadEnabled = gamepadEnabled;
+            PhysicalIdle.WriteField(StopRequestedField, 0);
+        }
+
+        public void Dispose()
+        {
+            // First, before anything is restored: a timer still ticking would poll against
+            // half-restored state.
+            StopGamepadTimer();
+
+            for (var i = 0; i < SlotArrayFields.Length; i++)
+            {
+                Array.Copy(
+                    _previousSlots[i],
+                    PhysicalIdle.ReadField<Array>(SlotArrayFields[i]),
+                    _previousSlots[i].Length);
+            }
+
+            GamepadEnabled = _previousGamepadEnabled;
+            PhysicalIdle.WriteField(StopRequestedField, _previousStopRequested);
+            PhysicalIdle.WriteField(PollInProgressField, _previousPollInProgress);
+        }
     }
 }

@@ -66,10 +66,16 @@ internal static class PhysicalIdle
     private const int XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE = 8689;
     private const byte XINPUT_GAMEPAD_TRIGGER_THRESHOLD = 30;
 
-    // These properties are written from the UI thread and read from low-level hook callback
-    // threads (KeyboardHookCallback, MouseHookCallback) and the gamepad polling thread.
-    // volatile is required so that writes on the UI thread are immediately visible to
-    // readers on the callback threads without needing a full memory barrier.
+    // ONE field, not "these properties": the injected-input suppression flag.
+    //
+    // It is written from the tray's UI thread and read inside the low-level hook callbacks --
+    // which run ON THAT SAME UI THREAD, not on threads of their own. Windows delivers a
+    // WH_KEYBOARD_LL / WH_MOUSE_LL callback on the thread that installed the hook, and blocks
+    // all system input until that callback returns; that is why nothing in either callback
+    // takes a lock, as several other comments in this file state emphatically. volatile is
+    // kept because the property is public and nothing stops another thread reading it, and
+    // because it pairs with the Interlocked writes on the deadline fields below -- NOT because
+    // a callback runs somewhere else. It does not.
     private static volatile bool _suppressInjected;
 
     // --- Injected-input suppression safety net ---
@@ -195,6 +201,14 @@ internal static class PhysicalIdle
         get => _useSystemIdleFailSafe;
         set => _useSystemIdleFailSafe = value;
     }
+
+    // 2000 IS NOT THE EFFECTIVE DEFAULT AND CANNOT BE. Every read of this setting goes through
+    // GetEffectiveSystemIdleFailSafeWindowMs, which floors it at
+    // AppConfig.MinimumSystemIdleFailSafeWindowMs (6000), so the narrowest window this class
+    // will ever apply is 6000 ms whatever is written here, and AppConfig's own default is that
+    // same floor. Read the literal below as "unset" -- it is the starting value of a field the
+    // tray overwrites from config during startup -- and not as a statement that a 2-second
+    // window is in force, because none ever is.
     public static int SystemIdleFailSafeWindowMs { get; set; } = 2000;
 
     // Diagnostics: non-zero if hook installation failed.
@@ -246,18 +260,34 @@ internal static class PhysicalIdle
     // write is also what makes the read safe on a 32-bit runtime.
     //
     // The callbacks stay outside _hookLivenessLock and that is sound, because a callback can
-    // only move this FORWARD. The tick's other writers -- NotifyExternalActivity and
-    // EnsureHooksStarted -- advance it under that lock, because for them the advance and the
-    // counter resets beside it are one act the tick must not be able to interleave with.
+    // only move this FORWARD. The two other writers are not the tick and are not on the input
+    // path: NotifyExternalActivity runs on the SystemEvents notification thread, and
+    // EnsureHooksStarted runs on the tick thread and on Start(). Both publish through
+    // AdvanceMonotonicTimestamp rather than a bare Exchange, because the stamp they would
+    // overwrite can be NEWER than the one they carry -- and rolling THIS field backwards
+    // manufactures precisely the gap the detector treats as evidence, so a clobber here does
+    // not merely lose information, it invents the fault. Both take the lock as well, because
+    // the advance and the counter resets beside it are one act the tick must not interleave
+    // with.
     private static long _lastHookCallbackMilliseconds = GetMonotonicMilliseconds();
 
     // How far behind the system's own idle clock the heartbeat has to fall before a tick
     // counts as evidence. Both readings come from the same tick counter and are taken one
     // after the other, so scheduling jitter moves them together and cannot manufacture a
     // gap -- only input that Windows saw and we did not can. The margin is here for the one
-    // benign source of invisible input: the secure desktop (lock screen, UAC prompt), whose
-    // keystrokes update this session's GetLastInputInfo but never reach a hook installed on
-    // the default desktop.
+    // benign source of invisible input: the secure desktop, whose keystrokes update this
+    // session's GetLastInputInfo but never reach a hook installed on the default desktop.
+    //
+    // ONLY THE LOCK SCREEN IS PROPERLY EXCUSED, and this margin is the entire excuse for the
+    // rest. SetHookSilenceExpected is wired to SessionLock, ConsoleDisconnect and
+    // RemoteDisconnect only. A UAC PROMPT RAISES NO SessionSwitch AT ALL, so nothing suspends
+    // the detector while one is on screen: a prompt left up for longer than these 10 seconds,
+    // followed by about 15 seconds (HookSilenceTicksRequired tray ticks) in which the user
+    // does not move the mouse, really does latch the detector and flip the tray to a DEGRADED
+    // warning saying Windows dropped the hook. That is a false alarm this code does not
+    // prevent. It is self-clearing -- the next real mouse move or keystroke fires a callback
+    // and the gap collapses -- but it is reachable, and this margin is a mitigation for it,
+    // not a fix.
     private const long HookSilenceGraceMs = 10000;
 
     // Consecutive ticks of evidence required before the state flips. The tray ticks every
@@ -364,6 +394,16 @@ internal static class PhysicalIdle
 
     private const int HookRepairRetryIntervalMs = 30000;
 
+    // PollGamepads's non-reentrancy guard. THE ONLY WRITER IS PollGamepads ITSELF: the callback
+    // that takes it (0 -> 1) is the callback that clears it, in its own finally. Nothing on the
+    // start/stop path may clear it, however confident that path is that the callback has
+    // finished -- StopGamepadTimer's timeout branch is confident of the exact opposite, and it
+    // used to clear the flag anyway.
+    //
+    // What it guards is the four-slot _gpConnected / _gpLastPacket / _gpLastState arrays, which
+    // PollGamepads reads and writes with no lock at all. Two callbacks inside them at once tear
+    // that state, and a torn read there is a phantom or a missed "the user is present" write --
+    // the one measurement this whole file exists to get right.
     private static int _gamepadPollInProgress;
     private static int _gamepadStopRequested;
     private static int _keyboardHookExceptionLogged;
@@ -805,7 +845,10 @@ internal static class PhysicalIdle
     /// Where the counter saturates. The caller passes
     /// <see cref="HookSilenceTicksRequired"/>: ticks beyond the threshold carry no
     /// information, and a counter that only ever grows is a counter that eventually
-    /// overflows into a negative and silently disarms the detector.
+    /// overflows into a negative and silently disarms the detector. Zero or negative is
+    /// treated as one, exactly as <see cref="IsHookDropSuspected"/> treats
+    /// <c>requiredTicks</c>: a tick that produced evidence has to be worth at least one
+    /// tick, or the cap turns the detector off instead of bounding it.
     /// </param>
     /// <returns>Zero when this tick produced no evidence, otherwise the advanced counter.</returns>
     internal static int NextHookSilenceTicks(
@@ -820,12 +863,23 @@ internal static class PhysicalIdle
             return 0;
         }
 
-        // Written as a comparison rather than Math.Min(currentTicks + 1, maxTicks) because
-        // the ADDITION is the thing that overflows: at int.MaxValue the increment wraps to
+        // The same floor IsHookDropSuspected puts on requiredTicks, and it is missing here for
+        // no better reason than that it was written second. Both parameters are reachable with
+        // arbitrary values -- both methods are internal and the test facade calls them
+        // directly -- and an unfloored cap fails in the one direction that matters:
+        // maxTicks: 0 pins the counter at 0 on every evidence tick, which does not bound the
+        // detector, it DISABLES it, silently and forever. A negative maxTicks is worse still,
+        // because `currentTicks >= maxTicks` is then satisfied immediately and the method
+        // RETURNS the negative -- the permanently-below-any-threshold counter the paragraph
+        // below exists to rule out, handed over as a result instead of reached by overflow.
+        var max = maxTicks < 1 ? 1 : maxTicks;
+
+        // Written as a comparison rather than Math.Min(currentTicks + 1, max) because the
+        // ADDITION is the thing that overflows: at int.MaxValue the increment wraps to
         // int.MinValue first and Math.Min then dutifully keeps the negative, leaving the
         // detector permanently below any threshold. Comparing before adding saturates DOWN
-        // to maxTicks instead, which is the only direction that can be correct here.
-        return currentTicks >= maxTicks ? maxTicks : currentTicks + 1;
+        // to max instead, which is the only direction that can be correct here.
+        return currentTicks >= max ? max : currentTicks + 1;
     }
 
     // One tick's worth of evidence that a hook stopped firing.
@@ -950,17 +1004,33 @@ internal static class PhysicalIdle
         }
 
         var previousReason = _loggedDegradationReason;
-        _loggedDegradationReason = reason;
 
+        // THE ASSIGNMENT COMES AFTER THE LOG CALL ON BOTH PATHS, NEVER BEFORE IT. This field is
+        // the "already announced" mark, and the dedupe above it suppresses every later attempt
+        // for as long as the reason string stays the same -- which for a degradation episode is
+        // every 5 s tick until it clears, potentially hours. Marking the episode announced and
+        // then going off to log it means anything that stops the log call from happening
+        // silences the one sentence that says WHY the app went degraded, for the whole episode.
+        //
+        // What this ordering does NOT buy, so nobody reads more into it than it deserves:
+        // Logger.Write catches its own I/O failures and returns normally, which is documented
+        // and accepted at the top of Logger.cs (a second instance holding the file with
+        // FileShare.Read is enough to lose a line). So a write that was swallowed still gets
+        // marked announced here, and closing that hole needs Logger to report failure, which
+        // it deliberately does not. What the ordering does buy is that no path between the
+        // decision and the write can set the mark without the write having been attempted and
+        // returned -- and it costs at most one duplicate line, which is the cheaper mistake.
         if (reason == null)
         {
             Logger.Info(
                 $"Physical idle tracking recovered: the previous degradation ('{previousReason}') is no longer present and hook readings are trusted again.");
+            _loggedDegradationReason = reason;
             return;
         }
 
         Logger.Warn(
             $"Physical idle tracking is degraded: {reason}. KeyboardHookInstalled={KeyboardHookInstalled} KeyboardHookError={LastKeyboardHookError} MouseHookInstalled={MouseHookInstalled} MouseHookError={LastMouseHookError}. Idle time is now measured from GetLastInputInfo, which cannot tell injected input from a real user, so an anti-idle tool can keep the machine looking busy while this lasts. A hook that stopped firing was most likely dropped by Windows for overrunning LowLevelHooksTimeout; that is reported here and never silently reinstalled.");
+        _loggedDegradationReason = reason;
     }
 
     /// <summary>
@@ -1099,14 +1169,22 @@ internal static class PhysicalIdle
             return;
         }
 
-        var nowMs = GetMonotonicMilliseconds();
-
         lock (_hookInstallLock)
         {
             if (HooksFullyInstalled)
             {
                 return;
             }
+
+            // SAMPLED INSIDE THE LOCK, and that is not tidiness. Acquiring _hookInstallLock is
+            // not instantaneous: SetGamepadEnabled holds it across StopGamepadTimer's bounded
+            // 2000 ms wait for an in-flight poll, so a menu toggle can park this call for two
+            // full seconds. Worse, the tick runs on an STA thread, where blocking on
+            // Monitor.Enter PUMPS MESSAGES -- so hook callbacks keep running and keep
+            // publishing fresh timestamps while we are queued. A clock read taken before that
+            // wait and written after it is a timestamp from before input this process has
+            // already seen and recorded.
+            var nowMs = GetMonotonicMilliseconds();
 
             var lastAttemptMs = Interlocked.Read(ref _lastHookInstallAttemptMilliseconds);
             if (!forceImmediateRetry
@@ -1154,7 +1232,15 @@ internal static class PhysicalIdle
 
             if (newlyInstalledAnyHook)
             {
-                Interlocked.Exchange(ref _lastPhysicalInputMilliseconds, nowMs);
+                // ADVANCE-ONLY, not a bare Exchange. This caller is not on the input path, so
+                // it obeys the rule stated on AdvanceMonotonicTimestamp for the same reason
+                // NotifyExternalActivity and GetIdleMilliseconds do: a hook callback or the
+                // gamepad poll can have published a NEWER stamp while we sat in the queue for
+                // _hookInstallLock, and overwriting it would move the idle clock backwards and
+                // hand the user idle time they never accrued. The previously installed hook
+                // keeps firing throughout this method -- it is the OTHER hook that is being
+                // repaired -- so a newer stamp is the ordinary case here, not an exotic race.
+                AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, nowMs);
 
                 // Same reasoning for the liveness detector. A hook installed one statement
                 // ago has not had the chance to fire, so silence from before this instant
@@ -1170,7 +1256,13 @@ internal static class PhysicalIdle
                 // for the install lock.
                 lock (_hookLivenessLock)
                 {
-                    Interlocked.Exchange(ref _lastHookCallbackMilliseconds, nowMs);
+                    // Advance-only here too, and the stakes are higher than on the idle clock:
+                    // rolling the HEARTBEAT back over a stamp a callback published while we
+                    // waited widens the gap the detector measures by exactly the length of the
+                    // wait. That does not merely lose information -- it fabricates the
+                    // evidence the drop detector is looking for, in the one method whose job
+                    // is to clear that evidence.
+                    AdvanceMonotonicTimestamp(ref _lastHookCallbackMilliseconds, nowMs);
                     Interlocked.Exchange(ref _consecutiveHookSilenceTicks, 0);
                     Interlocked.Exchange(ref _hookDropSuspected, 0);
                 }
@@ -1358,8 +1450,13 @@ internal static class PhysicalIdle
                 // Advance-only, like every other write to this field from off the input path:
                 // a bare Exchange can clobber a newer stamp that a hook callback or the gamepad
                 // poll published between our two reads, handing back idle time the user never
-                // accrued. That matters most in the drop-suspected branch, where the value is
-                // not bounded by effectiveWindowMs so the rollback could be arbitrarily large.
+                // accrued. HERE THE DAMAGE A CLOBBER COULD DO IS BOUNDED, unlike in the
+                // drop-suspected branch above: the condition on this very line requires
+                // sys <= effectiveWindowMs, so the correction is at most one fail-safe window
+                // old and a rollback cannot exceed it. The note in the other branch says the
+                // opposite because the other branch really is unbounded; it was copied down
+                // here verbatim by the v2.6.1 advance-only change and described this code
+                // wrongly for two releases.
                 AdvanceMonotonicTimestamp(ref _lastPhysicalInputMilliseconds, Math.Max(0, nowMs - (long)sys));
                 return sys;
             }
@@ -1432,8 +1529,28 @@ internal static class PhysicalIdle
     {
         // Same heartbeat, same reasoning as KeyboardHookCallback: this records that the hook
         // is still wired up, not that a human moved the mouse, so it is written for injected
-        // and nCode < 0 callbacks too. Either hook firing proves the chain is alive, which is
-        // why one timestamp serves both.
+        // and nCode < 0 callbacks too.
+        //
+        // ONE TIMESTAMP FOR TWO HOOKS MEANS A SINGLE-HOOK DROP IS NOT DETECTED, EVER. Windows
+        // removes a low-level hook per hook procedure, not per chain: a keyboard callback that
+        // overruns LowLevelHooksTimeout is dropped on its own and the mouse hook carries on
+        // untouched. From that moment the mouse callback keeps this shared heartbeat fresh,
+        // _kbHook is still non-null so KeyboardHookInstalled still answers true, and
+        // GetHookDegradationReason returns null -- a keyboard hook that will never fire again,
+        // reported as healthy for the rest of the process's life. What this detector does
+        // catch is both hooks going quiet together, which is what a dropped MOUSE hook looks
+        // like on a machine the user is driving with a mouse. The keyboard-only case is a
+        // known hole, stated here rather than papered over.
+        //
+        // DO NOT close it with one heartbeat per hook. Two independent heartbeats false-positive
+        // on the most ordinary user there is: someone reading with the mouse who has not touched
+        // the keyboard for minutes. The keyboard heartbeat goes stale, GetLastInputInfo keeps
+        // moving with the mouse, and the detector reports a dropped keyboard hook on a perfectly
+        // healthy machine -- a warning that fires during normal use, which is the one outcome
+        // that costs this feature everything it is for. A real fix needs a rule that can tell
+        // "no keystrokes happened" apart from "keystrokes happened and did not reach us", and
+        // GetLastInputInfo reports a single timestamp for all input, so it cannot tell them
+        // apart. That is a design decision, not a patch.
         Interlocked.Exchange(ref _lastHookCallbackMilliseconds, GetMonotonicMilliseconds());
 
         try
@@ -1498,7 +1615,18 @@ internal static class PhysicalIdle
             }
 
             Interlocked.Exchange(ref _gamepadStopRequested, 0);
-            Interlocked.Exchange(ref _gamepadPollInProgress, 0);
+
+            // _gamepadPollInProgress is deliberately NOT reset here, and this is the second
+            // half of the rule stated on its declaration. It belongs to whatever PollGamepads
+            // callback currently owns the arrays below, and starting a timer is not evidence
+            // that such a callback has finished: StopGamepadTimer's timeout path can hand this
+            // method an orphan that is still blocked inside XInputGetState. Clearing the flag
+            // would admit a fresh callback beside that orphan, which is precisely the
+            // concurrent access the flag exists to prevent -- and the orphan's own finally
+            // would then clear the NEW callback's flag and admit a third.
+            //
+            // With an orphan in flight every callback of the timer below bounces off the guard
+            // until the orphan returns and clears it; see StopGamepadTimer for what that costs.
 
             // Reset controller tracking inside the lock so PollGamepads never sees partial state.
             for (var i = 0; i < 4; i++)
@@ -1567,7 +1695,7 @@ internal static class PhysicalIdle
                     disposeEventHere = false;
 
                     Logger.Warn(
-                        $"Gamepad poll did not finish within {GamepadTimerDisposeWaitMs} ms of the timer being stopped; continuing without waiting. XInputGetState is most likely blocked in a driver.");
+                        $"Gamepad poll did not finish within {GamepadTimerDisposeWaitMs} ms of the timer being stopped; continuing without waiting. XInputGetState is most likely blocked in a driver. That callback still owns the poll state, so gamepad input will not count as activity even if gamepad support is switched back on; polling resumes by itself the moment the driver call returns.");
                 }
             }
         }
@@ -1582,7 +1710,27 @@ internal static class PhysicalIdle
                 disposedEvent.Dispose();
             }
 
-            Interlocked.Exchange(ref _gamepadPollInProgress, 0);
+            // _gamepadPollInProgress is deliberately NOT cleared here. This method used to
+            // clear it unconditionally -- INCLUDING on the branch above, which has just
+            // finished logging that the callback is still running. The flag belongs to that
+            // callback; clearing it from here is this class telling itself a lie about who
+            // owns the arrays.
+            //
+            // WHAT THAT MEANS FOR A GENUINE RESTART AFTER A TIMEOUT, which is the case worth
+            // being explicit about: the user toggles gamepad support off while XInputGetState
+            // is hung, the wait above times out, and they toggle it back on. The flag is still
+            // 1, so every callback of the new timer bounces off the guard and gamepad activity
+            // is NOT observed until the hung callback finally returns and clears the flag from
+            // its own finally -- at which point the new timer picks up on its next tick with no
+            // further intervention. That is the behaviour chosen here, deliberately, over the
+            // alternative of clearing the flag to "restore" polling: clearing it does not make
+            // the hung thread let go of the arrays, so the restored feature's first act would
+            // be to race it and misreport whether the user is present, and the hung callback's
+            // finally would then clear the new callback's guard and admit a third. A feature
+            // that is parked and says so in the log recovers; torn state does not announce
+            // itself at all. A hung XInputGetState is a driver fault that normally clears in
+            // seconds, and in the case where it never clears there is no safe way to resume
+            // anyway, because the thread that owns the arrays is still inside them.
         }
     }
 
@@ -1593,6 +1741,10 @@ internal static class PhysicalIdle
             return;
         }
 
+        // Take ownership of the poll state, or leave without touching anything because another
+        // callback already has it. NOTE WHERE THIS SITS: a bounced callback returns ABOVE the
+        // try below, so it never reaches the finally and cannot clear a flag it does not own.
+        // That placement is the ownership rule in one line -- see the field's declaration.
         if (Interlocked.Exchange(ref _gamepadPollInProgress, 1) != 0)
         {
             return;
@@ -1663,6 +1815,10 @@ internal static class PhysicalIdle
         }
         finally
         {
+            // The only clear of this flag anywhere in the class, and it is here because this
+            // is the only code that can know the arrays above are no longer being written.
+            // Runs however the body left -- early return, exception, or the loop finishing --
+            // so a callback that gives up on _gamepadStopRequested still hands ownership back.
             Interlocked.Exchange(ref _gamepadPollInProgress, 0);
         }
     }
