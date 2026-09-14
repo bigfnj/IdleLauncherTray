@@ -251,12 +251,24 @@ Log file is useful for diagnosing why a launch did or did not occur at a given t
 
 ## Version
 
-Current version: **2.7.0**
+Current version: **2.7.1**
 
 The authoritative version is `<Version>` in `IdleLauncherTray/IdleLauncherTray.csproj`. The release
 workflow derives the shipped assembly version from the git tag instead, so a tagged build always
 matches its tag regardless of what the csproj says.
 
+- **v2.7.1** — fixes two faults v2.7.0 introduced the same morning, both found by its own
+  post-release audit. Keeping the stored path unexpanded made "has a supported extension" a
+  property of the current machine's environment, so an undefined `%VAR%` was classified as an
+  unsupported TYPE and the target cleared; it is now `Unparseable`, which is kept. And reporting
+  startup as enabled purely because a Run value exists was the mirror of the bug it fixed: a moved
+  exe left the menu claiming ON while launching nothing, and the menu saying ON is what stops the
+  user performing the toggle that repairs it. Also: the session flag is read before the idle clock
+  (the writer order only protects a reader that reads it in that order); the clock-warp repair is
+  persisted rather than applied only in memory; `EnsureHooksStarted` publishes both timestamps
+  advance-only under the lock instead of with a stale clock; the gamepad re-entry guard is owned by
+  the callback that holds it; and the single-instance mutex no longer kills the process with no
+  diagnostic when another copy runs under different privileges.
 - **v2.7** — works down the defect list the v2.6 audits produced. Two items were the same shape as
   the bug v2.5 fixed: a guard correct where it was written and defeated one level up the call
   stack. The CPU delta sampler sat below `OnTick`'s running-target early return, so it was frozen

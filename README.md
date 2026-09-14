@@ -23,6 +23,34 @@ This project is intentionally **portable**:
 
 That means startup is only valid as long as the executable remains at the same path. If you move, rename, or replace the portable build, toggle **Run at startup** off and back on so the registry entry is refreshed.
 
+## v2.7.1 highlights
+
+The post-release audit of v2.7.0 found two faults that v2.7.0 itself had introduced that morning,
+which is the honest reason this release exists.
+
+- **An undefined environment variable in your target path deleted the setting.** v2.7.0 stopped
+  expanding the stored path so a portable config survives being moved between machines. That made
+  "does this have a supported extension" depend on the *current machine's* environment, because
+  Windows leaves an undefined `%NAME%` untouched and the result then has no extension at all. The
+  app called that an unsupported file type and cleared your target, permanently. Now treated the
+  same way as any other path this machine cannot resolve: kept, not deleted.
+- **"Run at startup" could say ON while starting nothing.** v2.7.0 reported startup as enabled
+  whenever a registry entry existed, which fixed short (8.3) paths and junctions. But move the
+  portable exe and the stale entry launches nothing, while the menu insisting it is already on is
+  exactly what stops you doing the untick/re-tick that repairs it. A non-matching entry is now
+  judged by whether the file it names still exists.
+
+Also from the same audit: the app could launch onto the desktop in the instant after you signed
+back in; a clock-correction repair was applied in memory but never written to disk, so it had to be
+redone on every start; ticking "Block injected input" could lock your machine; **Run Now** did
+nothing at all (no launch, no message) if a launch was already in flight; a single dropped input
+hook was invisible to the detector, and the comment claiming otherwise is corrected rather than
+left to justify it; and a startup failure caused by another copy of the app running under different
+privileges now says so instead of vanishing with no tray icon and no log.
+
+The tray tooltip now reads `Idle 3:20/15:00 - CPU 10% - v2.7.1`: what the launcher is doing, the
+CPU threshold you have configured, and the build that is running.
+
 ## v2.7 highlights
 
 Version 2.7 works down the defect list the v2.6 audits produced. Two of the items were the same
